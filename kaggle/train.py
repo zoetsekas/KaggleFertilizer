@@ -9,132 +9,202 @@ from ray.train import Checkpoint, RunConfig, ScalingConfig
 from ray.train.torch import TorchTrainer
 from ray.tune.schedulers import ASHAScheduler
 from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from sklearn.preprocessing import MinMaxScaler
 
-from kaggle import FertilizerClassifier, add_features
+from kaggle import FertilizerClassifier, add_features, feature_selection
 
 
 def train_func_with_tune(config):
-    num_epochs = config["num_epochs"]  # Can also be a hyperparameter
+    # num_epochs is per fold
+    num_epochs_per_fold = config["num_epochs"]  # Can also be a hyperparameter
+    n_splits = config.get("n_splits", 5)  # Get K for K-fold from config, default to 5
 
     # Access the dataset shards
     # ray.train.get_dataset_shard() works within ray.train, which TorchTrainer uses.
     # TorchTrainer is launched by Tune when used with tune.Tuner().
-    train_data_shard = ray.train.get_dataset_shard("train")
-    test_data_shard = ray.train.get_dataset_shard("test")  # For validation/reporting
+    # train_data_shard = ray.train.get_dataset_shard("train")
+    # test_data_shard = ray.train.get_dataset_shard("test")  # For validation/reporting
 
-    # Instantiate the model with hyperparameters from 'config'
-    model = FertilizerClassifier(
-        input_size=config["input_size"],
-        num_classes=config["num_classes"],
-        l1_units=config["l1_units"],
-        l2_units=config["l2_units"],
-        dropout_rate=config["dropout_rate"],
-        activation_fn_name=config["activation_fn"]
-    )
+    full_dataset_shard = ray.train.get_dataset_shard("dataset")  # Renamed from "train"
+    # Convert Ray Dataset shard to Pandas DataFrame to use StratifiedKFold
+    # This might be memory-intensive for very large datasets.
+    # Consider if your dataset fits in memory on the worker.
+    df_for_kfold = full_dataset_shard.to_pandas()
 
-    # Choose optimizer based on config
-    if config["optimizer"] == "Adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-    elif config["optimizer"] == "SGD":
-        optimizer = torch.optim.SGD(model.parameters(), lr=config["lr"], momentum=config.get("sgd_momentum", 0.9),
-                                    weight_decay=config["weight_decay"])
-    else:
-        raise ValueError(f"Unknown optimizer: {config['optimizer']}")
+    # Extract features (X) and labels (y) for StratifiedKFold
+    # Assuming 'labels' column exists and other columns are features
+    X_kfold = df_for_kfold[[col for col in df_for_kfold.columns if col.startswith('feature_')]].values
+    y_kfold = df_for_kfold["labels"].values
 
-    loss_fn = nn.CrossEntropyLoss()
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=config.get("fold_seed", 42))
 
-    str_device = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(str_device)
-    model.to(device)
+    fold_metrics_list = []
 
+    for fold_idx, (train_index, val_index) in enumerate(skf.split(X_kfold, y_kfold)):
+        print(
+            f"Worker {ray.train.get_context().get_local_rank()} - Trial {ray.train.get_context().get_trial_name()} - Fold {fold_idx + 1}/{n_splits}")
 
+        X_train_fold, X_val_fold = X_kfold[train_index], X_kfold[val_index]
+        y_train_fold, y_val_fold = y_kfold[train_index], y_kfold[val_index]
 
-    for epoch in range(num_epochs):
-        # --- Training Loop ---
-        model.train()
-        total_train_loss = 0
-        num_train_batches = 0
-        for batch in train_data_shard.iter_torch_batches(batch_size=config["batch_size"], dtypes=torch.float32,
-                                                         device=str_device):
-            features = batch["features"]
-            labels = batch["labels"].long()
+        # Convert fold data back to Ray Datasets for iter_torch_batches
+        # This is a bit of back-and-forth but allows using existing iter_torch_batches logic.
+        # Alternatively, you could adapt the training loop to directly use NumPy arrays/PyTorch Tensors.
+        train_fold_df = pd.DataFrame(X_train_fold, columns=[f'feature_{i}' for i in range(X_train_fold.shape[1])])
+        train_fold_df['labels'] = y_train_fold
+        train_fold_ray_dataset = ray.data.from_pandas(train_fold_df)
+        # No need to map_batches again if X_train_fold is already the correct feature array
 
-            optimizer.zero_grad()
-            outputs = model(features)
-            loss = loss_fn(outputs, labels)
-            loss.backward()
-            optimizer.step()
+        val_fold_df = pd.DataFrame(X_val_fold, columns=[f'feature_{i}' for i in range(X_val_fold.shape[1])])
+        val_fold_df['labels'] = y_val_fold
+        val_fold_ray_dataset = ray.data.from_pandas(val_fold_df)
 
-            total_train_loss += loss.item()
-            num_train_batches += 1
+        # Instantiate the model with hyperparameters from 'config'
+        model = FertilizerClassifier(
+            input_size=config["input_size"],
+            num_classes=config["num_classes"],
+            l1_units=config["l1_units"],
+            l2_units=config["l2_units"],
+            l3_units=config["l3_units"],
+            dropout_rate=config["dropout_rate"],
+            activation_fn_name=config["activation_fn"]
+        )
 
-        avg_train_loss = total_train_loss / num_train_batches
+        # Choose optimizer based on config
+        if config["optimizer"] == "Adam":
+            optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
+        elif config["optimizer"] == "SGD":
+            optimizer = torch.optim.SGD(model.parameters(), lr=config["lr"], momentum=config.get("sgd_momentum", 0.9),
+                                        weight_decay=config["weight_decay"])
+        elif config["optimizer"] == "AdamW":
+            optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
+        elif config["optimizer"] == "Adagrad":
+            optimizer = torch.optim.Adagrad(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
+        else:
+            raise ValueError(f"Unknown optimizer: {config['optimizer']}")
 
-        # --- Validation Loop (using test_data_shard) ---
-        model.eval()  # Set model to evaluation mode
+        loss_fn = nn.CrossEntropyLoss()
+        str_device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.device(str_device)
+        model.to(device)
+        avg_train_loss_epoch = 0
+        for epoch in range(num_epochs_per_fold):
+            # --- Training Loop for the current fold ---
+            model.train()
+            total_train_loss = 0
+            num_train_batches = 0
+
+            train_dataset_torch = torch.utils.data.TensorDataset(
+                torch.from_numpy(X_train_fold).float(),
+                torch.from_numpy(y_train_fold).long()
+            )
+            train_loader_fold = torch.utils.data.DataLoader(
+                train_dataset_torch, batch_size=config["batch_size"], shuffle=True
+            )
+
+            for features_tensor, labels_tensor in train_loader_fold:
+                features = features_tensor.to(device)
+                labels = labels_tensor.to(device)
+
+                optimizer.zero_grad()
+                outputs = model(features)
+                loss = loss_fn(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                total_train_loss += loss.item()
+                num_train_batches += 1
+
+            avg_train_loss_epoch = total_train_loss / num_train_batches if num_train_batches > 0 else 0
+            # Optionally print per-epoch-per-fold loss
+            print(f"  Epoch {epoch+1}, Fold Train Loss: {avg_train_loss_epoch:.4f}")
+
+        # --- Validation Loop for the current fold ---
+        model.eval()
         total_correct = 0
         total_samples = 0
         total_val_loss = 0
         num_val_batches = 0
-        total_ap_at_3 = 0.0  # Initialize sum of AP@3 scores
+        total_ap_at_3 = 0.0
+
+        val_dataset_torch = torch.utils.data.TensorDataset(
+            torch.from_numpy(X_val_fold).float(),
+            torch.from_numpy(y_val_fold).long()
+        )
+        val_loader_fold = torch.utils.data.DataLoader(
+            val_dataset_torch, batch_size=config["batch_size"]
+        )
 
         with torch.no_grad():
-            for batch in test_data_shard.iter_torch_batches(batch_size=config["batch_size"], dtypes=torch.float32,
-                                                            device=str_device):
-                features = batch["features"]
-                labels = batch["labels"].long()
+            for features_tensor, labels_tensor in val_loader_fold:
+                features = features_tensor.to(device)
+                labels = labels_tensor.to(device)
 
                 outputs = model(features)
-                val_loss = loss_fn(outputs, labels)
+                val_loss_batch = loss_fn(outputs, labels)
 
-                # Accuracy calculation
-                _, predicted_top1 = torch.max(outputs.data, 1)
+                _, predicted_top1 = torch.max(outputs, 1)  # Use outputs directly
                 total_samples += labels.size(0)
                 total_correct += (predicted_top1 == labels).sum().item()
-                total_val_loss += val_loss.item()
+                total_val_loss += val_loss_batch.item()
                 num_val_batches += 1
 
-                # MAP@3 Calculation
-                # Get top-3 predicted class indices.
-                # `outputs` are logits, shape (batch_size, num_classes)
-                _, top3_indices = torch.topk(outputs, 3, dim=1) # top3_indices shape: (batch_size, 3)
-
-                for i in range(labels.size(0)): # Iterate over samples in the batch
+                _, top3_indices = torch.topk(outputs, 3, dim=1)
+                for i in range(labels.size(0)):
                     true_label = labels[i]
-                    predicted_top3_for_sample = top3_indices[i] # Tensor of 3 predicted indices for this sample
-
+                    predicted_top3_for_sample = top3_indices[i]
                     ap_at_3_for_sample = 0.0
                     for rank_idx, pred_idx in enumerate(predicted_top3_for_sample):
-                        rank = rank_idx + 1 # Convert 0-indexed to 1-indexed rank
+                        rank = rank_idx + 1
                         if pred_idx == true_label:
                             ap_at_3_for_sample = 1.0 / rank
-                            break # True label found, AP@3 is set for this sample
+                            break
                     total_ap_at_3 += ap_at_3_for_sample
 
-        accuracy = total_correct / total_samples if total_samples > 0 else 0
-        avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0
-        map_at_3 = total_ap_at_3 / total_samples if total_samples > 0 else 0
+        fold_accuracy = total_correct / total_samples if total_samples > 0 else 0
+        fold_avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0
+        fold_map_at_3 = total_ap_at_3 / total_samples if total_samples > 0 else 0
 
-        print(f"Worker {ray.train.get_context().get_local_rank()} - Epoch {epoch + 1}, "
-              f"Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
-              f"Accuracy: {accuracy:.4f}, MAP@3: {map_at_3:.4f}")
-
-        # Report metrics to Ray Tune
-        ray.train.report(metrics={
-            "loss": avg_train_loss,
-            "val_loss": avg_val_loss,
-            "accuracy": accuracy,
-            "map_at_3": map_at_3  # Add MAP@3 to reported metrics
+        fold_metrics_list.append({
+            "loss": avg_train_loss_epoch,  # Or avg train loss over all epochs for this fold
+            "val_loss": fold_avg_val_loss,
+            "accuracy": fold_accuracy,
+            "map_at_3": fold_map_at_3
         })
+        print(
+            f"  Fold {fold_idx + 1} Metrics: Val Loss: {fold_avg_val_loss:.4f}, Accuracy: {fold_accuracy:.4f}, MAP@3: {fold_map_at_3:.4f}")
+
+        # Aggregate metrics across folds
+    if fold_metrics_list:
+        avg_loss_all_folds = np.mean([m["loss"] for m in fold_metrics_list])
+        avg_val_loss_all_folds = np.mean([m["val_loss"] for m in fold_metrics_list])
+        avg_accuracy_all_folds = np.mean([m["accuracy"] for m in fold_metrics_list])
+        avg_map_at_3_all_folds = np.mean([m["map_at_3"] for m in fold_metrics_list])
+    else:  # Should not happen if n_splits > 0
+        avg_loss_all_folds = 0
+        avg_val_loss_all_folds = 0
+        avg_accuracy_all_folds = 0
+        avg_map_at_3_all_folds = 0
+
+    print(
+        f"Worker {ray.train.get_context().get_local_rank()} - Trial End. Avg Val Loss: {avg_val_loss_all_folds:.4f}, Avg Accuracy: {avg_accuracy_all_folds:.4f}, Avg MAP@3: {avg_map_at_3_all_folds:.4f}")
+
+    ray.train.report(metrics={
+        "loss": avg_loss_all_folds,  # This is now average training loss across folds
+        "val_loss": avg_val_loss_all_folds,
+        "accuracy": avg_accuracy_all_folds,
+        "map_at_3": avg_map_at_3_all_folds
+    })
 
 if __name__ == '__main__':
     # Initialize Ray if not already initialized
     if not ray.is_initialized():
         ray.init()
 
-    df = pd.read_csv('../data/train.csv')
+    df1 = pd.read_csv('../data/train.csv')
+    df2 = pd.read_csv('../data/Fertilizer_Prediction.csv')
+    df = pd.concat([df1, df2], ignore_index=True)
 
     df = df.drop(columns=['id'])
 
@@ -175,11 +245,30 @@ if __name__ == '__main__':
                       'Temp_Moisture_Interaction', 'Temp_Humidity_Interaction', 'Hum_Moisture_Interaction',
                       'Temperature_Squared', 'Humidity_Squared', 'Moisture_Squared'
                       ]
-    CATEGORICAL_COLS = ['Soil Type', 'Crop Type']
+    CATEGORICAL_COLS = ['Soil Type', 'Crop Type',
+                        'Temparature_Binned', 'Humidity_Binned', 'Moisture_Binned',
+                        'Potassium_Binned', 'Phosphorous_Binned', 'Nitrogen_Binned']
 
     # Separate features (X) and target (y)
     X = df.drop(columns=[TARGET_COLUMN])
     y = df[TARGET_COLUMN]
+
+    # Select the best features
+    X = feature_selection(input_df=X, target_df=y)
+
+    # Drop the duplicate rows
+    X = X.drop_duplicates()
+
+    numerical_columns = []
+    for current_column in NUMERICAL_COLS:
+        if current_column in X.columns:
+            numerical_columns.append(current_column)
+
+    categorical_columns = []
+    for current_column in CATEGORICAL_COLS:
+        if current_column in X.columns:
+            categorical_columns.append(current_column)
+
 
     # --- Target Encoding ---
     # Encode the target variable 'Fertilizer Name' into numerical labels
@@ -192,8 +281,8 @@ if __name__ == '__main__':
     # --- Feature Preprocessing with Scaling for numerical ---
     preprocessor = ColumnTransformer(
         transformers=[
-            ('num', MinMaxScaler(feature_range=(-1, 1)), NUMERICAL_COLS),  # Scale numerical features
-            ('cat', OneHotEncoder(handle_unknown='ignore'), CATEGORICAL_COLS)
+            ('num', MinMaxScaler(feature_range=(-1, 1)), numerical_columns),  # Scale numerical features
+            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_columns)
         ],
         remainder='drop'  # Drop any columns not explicitly transformed (like 'id' if it wasn't dropped already)
     )
@@ -257,11 +346,15 @@ if __name__ == '__main__':
         "batch_size": tune.choice([128, 256, 512]),
         "dropout_rate": tune.uniform(0.1, 0.5),
         "weight_decay": tune.loguniform(1e-5, 1e-3),
-        "activation_fn": tune.choice(["relu", "leaky_relu", "elu"]),
+        "activation_fn": tune.choice(["relu", "leaky_relu", "elu", "gelu", "silu"]),
         "l1_units": tune.choice([64, 128, 256]),
         "l2_units": tune.choice([32, 64, 128]),
-        "optimizer": tune.choice(["Adam", "SGD"]),
-        "num_epochs": 30  # Fixed number of epochs for each trial for simplicity
+        "l3_units": tune.choice([8, 16, 32]),
+        "optimizer": tune.choice(["Adam", "SGD", "AdamW"]),
+        # "num_epochs": 30,  # Fixed number of epochs for each trial for simplicity
+        "num_epochs": 15,  # Number of epochs PER FOLD
+        "n_splits": 5,  # Number of folds for StratifiedKFold (can also be tuned: tune.choice([3, 5]))
+        "fold_seed": tune.randint(0, 1000)  # Optional: vary seed for k-fold split per trial
     }
 
     USE_GPU = False
@@ -272,43 +365,47 @@ if __name__ == '__main__':
     # 6. Configure and Run Ray Tune
     # Use TorchTrainer within the tune.Tuner
 
+    # For StratifiedKFold within each trial, num_workers=1 is often simplest
+    # as the K-fold logic runs sequentially on that one worker.
+    # If you use num_workers > 1, you need a more complex strategy for distributing folds.
     if USE_GPU:
-        trainable = TorchTrainer(
-            train_loop_per_worker=train_func_with_tune,
-            scaling_config=ScalingConfig(num_workers=1, use_gpu=USE_GPU, resources_per_worker={"CPU": 4, "GPU": 1}),
-            datasets={"train": train_dataset, "test": test_dataset}  # Pass both datasets
-        )
+        scaling_config = ScalingConfig(num_workers=1, use_gpu=True, resources_per_worker={"CPU": 4, "GPU": 1})
     else:
-        trainable = TorchTrainer(
-            train_loop_per_worker=train_func_with_tune,
-            scaling_config=ScalingConfig(num_workers=4, use_gpu=USE_GPU),
-            datasets={"train": train_dataset, "test": test_dataset}  # Pass both datasets
-        )
+        scaling_config = ScalingConfig(num_workers=1, use_gpu=False,
+                                       resources_per_worker={"CPU": 4})  # Or more CPUs
 
-    # Optional: Define a scheduler for early stopping (e.g., ASHA)
-    # This helps stop bad performing trials early to save resources.
+    trainable = TorchTrainer(
+        train_loop_per_worker=train_func_with_tune,
+        scaling_config=scaling_config,
+        # Pass the FULL dataset. It will be named "dataset" inside train_func_with_tune
+        datasets={"dataset": ray_dataset}
+    )
+
     scheduler = ASHAScheduler(
-        metric="val_loss",  # Metric to monitor for early stopping
-        mode="min",  # We want to minimize validation loss
-        max_t=30,  # Max epochs per trial (should match num_epochs in config)
-        grace_period=1,  # Don't stop trials before 1 epoch
-        reduction_factor=2  # Factor for reducing active trials
+        metric="val_loss",  # This will be average val_loss across folds
+        mode="min",
+        max_t=search_space["num_epochs"] * search_space["n_splits"],  # Max "time" can be total epochs
+        grace_period=search_space["n_splits"],  # Min "time" before stopping (e.g., complete one full CV)
+        reduction_factor=2
     )
 
     tuner = tune.Tuner(
-        trainable,
+        trainable=trainable,
         param_space={"train_loop_config": search_space},
         tune_config=tune.TuneConfig(
-            num_samples=6,  # Number of different hyperparameter combinations to try
-            scheduler=scheduler  # Apply the scheduler
+            num_samples=10,  # Number of different hyperparameter combinations to try
+            scheduler=scheduler
         ),
         run_config=RunConfig(
-            name="torch_trainer_experiment",
-            # storage_path=output_dir,  # Set the desired output directory
+            name="fertilizer_kfold_experiment",
             checkpoint_config=tune.CheckpointConfig(
-                checkpoint_score_attribute="loss",  # Metric to use for best checkpoint
-                checkpoint_score_order="min",  # Smaller loss is better
-                num_to_keep=1,  # Only keep the single best checkpoint
+                # Checkpointing with K-fold is more complex.
+                # You might checkpoint the model after all K folds,
+                # or the best model from one of the folds.
+                # For now, let's assume we checkpoint based on the avg val_loss.
+                checkpoint_score_attribute="val_loss",
+                checkpoint_score_order="min",
+                num_to_keep=1,
             ),
         ),
     )
