@@ -1,472 +1,453 @@
+import glob
+import json
 import os
+from datetime import datetime
+
+import joblib
 import numpy as np
 import pandas as pd
 import ray
 import torch
 import torch.nn as nn
 from ray import tune
-from ray.train import Checkpoint, RunConfig, ScalingConfig
-from ray.train.torch import TorchTrainer
+from ray.tune import RunConfig, report, TuneConfig
 from ray.tune.schedulers import ASHAScheduler
 from sklearn.compose import ColumnTransformer
+from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import TensorDataset, DataLoader
 
-from kaggle import FertilizerClassifier, add_features, feature_selection
+from kaggle import FertilizerClassifier, add_features, select_features
 
 
-def train_func_with_tune(config):
-    # num_epochs is per fold
-    num_epochs_per_fold = config["num_epochs"]  # Can also be a hyperparameter
-    n_splits = config.get("n_splits", 5)  # Get K for K-fold from config, default to 5
+# --- 1. Refactored Trainable Function with Internal K-Fold ---
+def train_with_internal_kfold(config):
+    """
+    This function performs a full K-Fold cross-validation for a single
+    hyperparameter configuration. It reports metrics after each fold to
+    work with schedulers like ASHAScheduler.
+    """
+    # --- Data and K-Fold Setup ---
+    X_kfold = ray.get(config["X_ref"])
+    y_kfold = ray.get(config["y_ref"])
 
-    # Access the dataset shards
-    # ray.train.get_dataset_shard() works within ray.train, which TorchTrainer uses.
-    # TorchTrainer is launched by Tune when used with tune.Tuner().
-    # train_data_shard = ray.train.get_dataset_shard("train")
-    # test_data_shard = ray.train.get_dataset_shard("test")  # For validation/reporting
+    n_splits = config["n_splits"]
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-    full_dataset_shard = ray.train.get_dataset_shard("dataset")  # Renamed from "train"
-    # Convert Ray Dataset shard to Pandas DataFrame to use StratifiedKFold
-    # This might be memory-intensive for very large datasets.
-    # Consider if your dataset fits in memory on the worker.
-    df_for_kfold = full_dataset_shard.to_pandas()
+    fold_metrics = []
 
-    # Extract features (X) and labels (y) for StratifiedKFold
-    # Assuming 'labels' column exists and other columns are features
-    X_kfold = df_for_kfold[[col for col in df_for_kfold.columns if col.startswith('feature_')]].values
-    y_kfold = df_for_kfold["labels"].values
-
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=config.get("fold_seed", 42))
-
-    fold_metrics_list = []
-
+    # --- Loop over each fold ---
     for fold_idx, (train_index, val_index) in enumerate(skf.split(X_kfold, y_kfold)):
-        print(
-            f"Worker {ray.train.get_context().get_local_rank()} - Trial {ray.train.get_context().get_trial_name()} - Fold {fold_idx + 1}/{n_splits}")
+        print(f"--- Starting Fold {fold_idx + 1}/{n_splits} ---")
 
-        X_train_fold, X_val_fold = X_kfold[train_index], X_kfold[val_index]
-        y_train_fold, y_val_fold = y_kfold[train_index], y_kfold[val_index]
+        X_train_fold, X_val_fold = X_kfold.iloc[train_index].values, X_kfold.iloc[val_index].values
+        y_train_fold, y_val_fold = y_kfold.iloc[train_index].values, y_kfold.iloc[val_index].values
 
-        # Convert fold data back to Ray Datasets for iter_torch_batches
-        # This is a bit of back-and-forth but allows using existing iter_torch_batches logic.
-        # Alternatively, you could adapt the training loop to directly use NumPy arrays/PyTorch Tensors.
-        train_fold_df = pd.DataFrame(X_train_fold, columns=[f'feature_{i}' for i in range(X_train_fold.shape[1])])
-        train_fold_df['labels'] = y_train_fold
-        train_fold_ray_dataset = ray.data.from_pandas(train_fold_df)
-        # No need to map_batches again if X_train_fold is already the correct feature array
+        train_dataset_torch = TensorDataset(torch.from_numpy(X_train_fold).float(),
+                                            torch.from_numpy(y_train_fold).long().squeeze())
+        val_dataset_torch = TensorDataset(torch.from_numpy(X_val_fold).float(),
+                                          torch.from_numpy(y_val_fold).long().squeeze())
 
-        val_fold_df = pd.DataFrame(X_val_fold, columns=[f'feature_{i}' for i in range(X_val_fold.shape[1])])
-        val_fold_df['labels'] = y_val_fold
-        val_fold_ray_dataset = ray.data.from_pandas(val_fold_df)
+        train_loader = DataLoader(train_dataset_torch, batch_size=config["batch_size"], shuffle=True)
+        val_loader = DataLoader(val_dataset_torch, batch_size=config["batch_size"])
 
-        # Instantiate the model with hyperparameters from 'config'
+        # --- Re-initialize Model and Optimizer for each fold ---
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         model = FertilizerClassifier(
             input_size=config["input_size"],
             num_classes=config["num_classes"],
             l1_units=config["l1_units"],
             l2_units=config["l2_units"],
             l3_units=config["l3_units"],
+            l4_units=config["l4_units"],
             dropout_rate=config["dropout_rate"],
             activation_fn_name=config["activation_fn"]
-        )
+        ).to(device)
 
-        # Choose optimizer based on config
-        if config["optimizer"] == "Adam":
-            optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-        elif config["optimizer"] == "SGD":
-            optimizer = torch.optim.SGD(model.parameters(), lr=config["lr"], momentum=config.get("sgd_momentum", 0.9),
-                                        weight_decay=config["weight_decay"])
-        elif config["optimizer"] == "AdamW":
-            optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-        elif config["optimizer"] == "Adagrad":
-            optimizer = torch.optim.Adagrad(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-        else:
-            raise ValueError(f"Unknown optimizer: {config['optimizer']}")
-
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
         loss_fn = nn.CrossEntropyLoss()
-        str_device = "cuda" if torch.cuda.is_available() else "cpu"
-        device = torch.device(str_device)
-        model.to(device)
-        avg_train_loss_epoch = 0
-        for epoch in range(num_epochs_per_fold):
-            # --- Training Loop for the current fold ---
+
+        # --- Training Loop for the current fold ---
+        for epoch in range(config["num_epochs"]):
             model.train()
-            total_train_loss = 0
-            num_train_batches = 0
-
-            train_dataset_torch = torch.utils.data.TensorDataset(
-                torch.from_numpy(X_train_fold).float(),
-                torch.from_numpy(y_train_fold).long()
-            )
-            train_loader_fold = torch.utils.data.DataLoader(
-                train_dataset_torch, batch_size=config["batch_size"], shuffle=True
-            )
-
-            for features_tensor, labels_tensor in train_loader_fold:
-                features = features_tensor.to(device)
-                labels = labels_tensor.to(device)
-
+            for features, labels in train_loader:
+                features, labels = features.to(device), labels.to(device)
                 optimizer.zero_grad()
                 outputs = model(features)
                 loss = loss_fn(outputs, labels)
                 loss.backward()
                 optimizer.step()
-                total_train_loss += loss.item()
-                num_train_batches += 1
 
-            avg_train_loss_epoch = total_train_loss / num_train_batches if num_train_batches > 0 else 0
-            # Optionally print per-epoch-per-fold loss
-            print(f"  Epoch {epoch+1}, Fold Train Loss: {avg_train_loss_epoch:.4f}")
-
-        # --- Validation Loop for the current fold ---
+        # --- Validation for the current fold ---
         model.eval()
-        total_correct = 0
-        total_samples = 0
-        total_val_loss = 0
-        num_val_batches = 0
-        total_ap_at_3 = 0.0
-
-        val_dataset_torch = torch.utils.data.TensorDataset(
-            torch.from_numpy(X_val_fold).float(),
-            torch.from_numpy(y_val_fold).long()
-        )
-        val_loader_fold = torch.utils.data.DataLoader(
-            val_dataset_torch, batch_size=config["batch_size"]
-        )
-
+        total_correct, total_samples, total_val_loss, total_ap_at_3 = 0, 0, 0, 0.0
+        all_preds, all_labels = [], []
         with torch.no_grad():
-            for features_tensor, labels_tensor in val_loader_fold:
-                features = features_tensor.to(device)
-                labels = labels_tensor.to(device)
-
+            for features, labels in val_loader:
+                features, labels = features.to(device), labels.to(device)
                 outputs = model(features)
                 val_loss_batch = loss_fn(outputs, labels)
-
-                _, predicted_top1 = torch.max(outputs, 1)  # Use outputs directly
+                _, predicted_top1 = torch.max(outputs, 1)
                 total_samples += labels.size(0)
                 total_correct += (predicted_top1 == labels).sum().item()
                 total_val_loss += val_loss_batch.item()
-                num_val_batches += 1
-
+                all_preds.extend(predicted_top1.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
                 _, top3_indices = torch.topk(outputs, 3, dim=1)
                 for i in range(labels.size(0)):
-                    true_label = labels[i]
-                    predicted_top3_for_sample = top3_indices[i]
-                    ap_at_3_for_sample = 0.0
-                    for rank_idx, pred_idx in enumerate(predicted_top3_for_sample):
-                        rank = rank_idx + 1
-                        if pred_idx == true_label:
-                            ap_at_3_for_sample = 1.0 / rank
-                            break
-                    total_ap_at_3 += ap_at_3_for_sample
+                    if labels[i] in top3_indices[i]:
+                        rank = (top3_indices[i] == labels[i]).nonzero(as_tuple=True)[0].item() + 1
+                        total_ap_at_3 += 1.0 / rank
 
-        fold_accuracy = total_correct / total_samples if total_samples > 0 else 0
-        fold_avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0
-        fold_map_at_3 = total_ap_at_3 / total_samples if total_samples > 0 else 0
+        # Store metrics for this fold
+        fold_accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+        fold_avg_val_loss = total_val_loss / len(val_loader) if len(val_loader) > 0 else float('inf')
+        fold_map_at_3 = total_ap_at_3 / total_samples if total_samples > 0 else 0.0
+        fold_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
 
-        fold_metrics_list.append({
-            "loss": avg_train_loss_epoch,  # Or avg train loss over all epochs for this fold
+        fold_metrics.append({
             "val_loss": fold_avg_val_loss,
             "accuracy": fold_accuracy,
-            "map_at_3": fold_map_at_3
+            "map_at_3": fold_map_at_3,
+            "f1_score": fold_f1
         })
         print(
-            f"  Fold {fold_idx + 1} Metrics: Val Loss: {fold_avg_val_loss:.4f}, Accuracy: {fold_accuracy:.4f}, MAP@3: {fold_map_at_3:.4f}")
+            f"--- Fold {fold_idx + 1} Metrics: Val Loss: {fold_avg_val_loss:.4f}, Accuracy: {fold_accuracy:.4f}, F1: {fold_f1:.4f} ---")
 
-        # Aggregate metrics across folds
-    if fold_metrics_list:
-        avg_loss_all_folds = np.mean([m["loss"] for m in fold_metrics_list])
-        avg_val_loss_all_folds = np.mean([m["val_loss"] for m in fold_metrics_list])
-        avg_accuracy_all_folds = np.mean([m["accuracy"] for m in fold_metrics_list])
-        avg_map_at_3_all_folds = np.mean([m["map_at_3"] for m in fold_metrics_list])
-    else:  # Should not happen if n_splits > 0
-        avg_loss_all_folds = 0
-        avg_val_loss_all_folds = 0
-        avg_accuracy_all_folds = 0
-        avg_map_at_3_all_folds = 0
+        # --- Report CUMULATIVE average metrics to Ray Tune after each fold ---
+        # This makes the trial compatible with early-stopping schedulers like ASHAScheduler
+        avg_metrics = {
+            "val_loss": np.mean([m["val_loss"] for m in fold_metrics]),
+            "accuracy": np.mean([m["accuracy"] for m in fold_metrics]),
+            "map_at_3": np.mean([m["map_at_3"] for m in fold_metrics]),
+            "f1_score": np.mean([m["f1_score"] for m in fold_metrics])
+        }
+        report(avg_metrics)
 
-    print(
-        f"Worker {ray.train.get_context().get_local_rank()} - Trial End. Avg Val Loss: {avg_val_loss_all_folds:.4f}, Avg Accuracy: {avg_accuracy_all_folds:.4f}, Avg MAP@3: {avg_map_at_3_all_folds:.4f}")
 
-    ray.train.report(metrics={
-        "loss": avg_loss_all_folds,  # This is now average training loss across folds
-        "val_loss": avg_val_loss_all_folds,
-        "accuracy": avg_accuracy_all_folds,
-        "map_at_3": avg_map_at_3_all_folds
+def load_best_model(config_path, model_path, device="cpu"):
+    """
+    Loads the best model from a saved state dictionary and configuration file.
+
+    Args:
+        config_path (str): Path to the best_tune_result.json file.
+        model_path (str): Path to the best_model.pt file.
+        device (str): The device to load the model onto ('cpu' or 'cuda').
+
+    Returns:
+        torch.nn.Module: The loaded model, ready for inference.
+    """
+    print(f"Loading model configuration from: {config_path}")
+    with open(config_path, 'r') as f:
+        saved_result = json.load(f)
+
+    best_config = saved_result['best_config']
+
+    print("Instantiating model with the best hyperparameters...")
+    model = FertilizerClassifier(
+        input_size=best_config["input_size"],
+        num_classes=best_config["num_classes"],
+        l1_units=best_config["l1_units"],
+        l2_units=best_config["l2_units"],
+        l3_units=best_config["l3_units"],
+        l4_units=best_config["l4_units"],
+        dropout_rate=best_config["dropout_rate"],
+        activation_fn_name=best_config["activation_fn"]
+    )
+
+    print(f"Loading model state from: {model_path}")
+    model_state_dict = torch.load(model_path, map_location=torch.device(device))
+    model.load_state_dict(model_state_dict)
+
+    model.to(device)
+    model.eval()  # Set the model to evaluation mode
+
+    print("Model loaded successfully and set to evaluation mode.")
+    return model
+
+
+def create_submission_file(test_data_path, submission_path, model_path, config_path, preprocessor_path,
+                           label_encoder_path, selected_columns_path):
+    """
+    Loads test data, preprocesses it, makes predictions with the best model,
+    and creates a submission.csv file.
+    """
+    print("\n--- Creating Submission File ---")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # --- Load all necessary artifacts ---
+    model = load_best_model(config_path, model_path, device)
+    preprocessor = joblib.load(preprocessor_path)
+    label_encoder = joblib.load(label_encoder_path)
+    with open(selected_columns_path, 'r') as f:
+        selected_columns = json.load(f)
+
+    # --- Load and Preprocess Test Data ---
+    print(f"Loading test data from {test_data_path}")
+    test_df = pd.read_csv(test_data_path)
+    # Keep the 'id' column for the final submission file
+    test_ids = test_df['id']
+
+    print("Applying feature engineering to test data...")
+    test_df = add_features(test_df)
+
+    # Ensure test set has all columns needed for preprocessor, add missing ones with 0
+    training_cols = preprocessor.feature_names_in_
+    for col in training_cols:
+        if col not in test_df.columns:
+            test_df[col] = 0
+    test_df = test_df[training_cols]  # Ensure order is the same
+
+    print("Applying preprocessing to test data...")
+    X_test_processed_np = preprocessor.transform(test_df)
+
+    # Get feature names from the preprocessor
+    feature_names = preprocessor.get_feature_names_out()
+    X_test_processed = pd.DataFrame(X_test_processed_np, columns=feature_names)
+
+    # Filter to only the columns the model was trained on
+    X_test_selected = X_test_processed[selected_columns]
+
+    # --- Make Predictions ---
+    print("Making predictions on the test set...")
+    X_test_tensor = torch.from_numpy(X_test_selected.values).float().to(device)
+
+    all_predictions = []
+    with torch.no_grad():
+        # Process in batches to avoid memory issues with large test sets
+        test_dataset = TensorDataset(X_test_tensor)
+        test_loader = DataLoader(test_dataset, batch_size=512)
+        for batch in test_loader:
+            features = batch[0]
+            outputs = model(features)
+            _, predicted_indices = torch.max(outputs, 1)
+            all_predictions.extend(predicted_indices.cpu().numpy())
+
+    # Inverse transform the predicted indices to get the original fertilizer names
+    predicted_fertilizer_names = label_encoder.inverse_transform(all_predictions)
+
+    # --- Create and Save Submission File ---
+    submission_df = pd.DataFrame({
+        'id': test_ids,
+        'Fertilizer Name': predicted_fertilizer_names
     })
 
-if __name__ == '__main__':
+    submission_df.to_csv(submission_path, index=False)
+    print(f"Submission file created successfully at: {submission_path}")
+
+def pipeline(include_data_prep:bool=True, artifacts_dir: str = "run_artifacts"):
     # Initialize Ray if not already initialized
     if not ray.is_initialized():
-        ray.init()
+        ray.init(include_dashboard=False)
 
-    df1 = pd.read_csv('../data/train.csv')
-    df2 = pd.read_csv('../data/Fertilizer_Prediction.csv')
-    df = pd.concat([df1, df2], ignore_index=True)
+    # Define paths for saving artifacts
+    output_dir = artifacts_dir
+    os.makedirs(output_dir, exist_ok=True)
+    preprocessor_path = os.path.join(output_dir, "preprocessor.joblib")
+    label_encoder_path = os.path.join(output_dir, "label_encoder.joblib")
+    selected_columns_path = os.path.join(output_dir, "selected_columns.json")
 
-    df = df.drop(columns=['id'])
+    if include_data_prep:
+        df1 = pd.read_csv('../data/train.csv')
+        df2 = pd.read_csv('../data/Fertilizer_Prediction.csv')
+        df = pd.concat([df1, df2], ignore_index=True)
 
-    df = add_features(df)
+        df = df.drop(columns=['id'])
 
-    # sample:pd.DataFrame = df.head(5)
-    # now = datetime.now()
-    # timestamp = now.strftime("%Y-%m-%d_%H-%M-%S")
-    # sample.to_csv(f'../data/{timestamp}_sample.csv', index=False)
-    #
-    # df.to_csv(f'../data/{timestamp}_augmented.csv', index=False)
-    #
-    # print("\nDataFrame Descriptive Statistics (Numerical Columns):")
-    # print(df.describe())
-    # df.describe().to_csv(f'../data/{timestamp}_describe.csv', index=True)
+        # Preprocessing
+        df = add_features(df)
 
-    print("\nValue Counts for Categorical Columns:")
-    print("Soil_Type:\n", df['Soil Type'].value_counts())
-    print("\nCrop_Type:\n", df['Crop Type'].value_counts())
-    print("\nFertilizer_Name:\n", df['Fertilizer Name'].value_counts())
-    print("Temparature_Binned:\n", df['Temparature_Binned'].value_counts())
-    print("\nHumidity_Binned:\n", df['Humidity_Binned'].value_counts())
-    print("\nMoisture_Binned:\n", df['Moisture_Binned'].value_counts())
-    print("\nNitrogen_Binned:\n", df['Nitrogen_Binned'].value_counts())
-    print("\nPotassium_Binned:\n", df['Potassium_Binned'].value_counts())
-    print("\nPhosphorous_Binned:\n", df['Phosphorous_Binned'].value_counts())
-
-    # exit()
-
-    # Preprocessing
-    # Define the target column
-    TARGET_COLUMN = 'Fertilizer Name'
-
-    # Define numerical and categorical features (excluding 'id' and the target)
-    NUMERICAL_COLS = ['Temparature', 'Humidity', 'Moisture', 'Nitrogen', 'Potassium', 'Phosphorous',
-                      'NP_Ratio', 'NK_Ratio', 'PK_Ratio', 'Total_NPK',
-                      'N_Percentage', 'P_Percentage', 'K_Percentage',
-                      'Temp_Moisture_Interaction', 'Temp_Humidity_Interaction', 'Hum_Moisture_Interaction',
-                      'Temperature_Squared', 'Humidity_Squared', 'Moisture_Squared'
-                      ]
-    CATEGORICAL_COLS = ['Soil Type', 'Crop Type',
-                        'Temparature_Binned', 'Humidity_Binned', 'Moisture_Binned',
-                        'Potassium_Binned', 'Phosphorous_Binned', 'Nitrogen_Binned']
-
-    # Separate features (X) and target (y)
-    X = df.drop(columns=[TARGET_COLUMN])
-    y = df[TARGET_COLUMN]
-
-    # Select the best features
-    X = feature_selection(input_df=X, target_df=y)
-
-    # Drop the duplicate rows
-    X = X.drop_duplicates()
-
-    numerical_columns = []
-    for current_column in NUMERICAL_COLS:
-        if current_column in X.columns:
-            numerical_columns.append(current_column)
-
-    categorical_columns = []
-    for current_column in CATEGORICAL_COLS:
-        if current_column in X.columns:
-            categorical_columns.append(current_column)
+        # Drop the duplicate rows
+        df = df.drop_duplicates()
 
 
-    # --- Target Encoding ---
-    # Encode the target variable 'Fertilizer Name' into numerical labels
-    label_encoder = LabelEncoder()
-    y_encoded = label_encoder.fit_transform(y)
-    NUM_CLASSES = len(label_encoder.classes_)  # Global variable for num_classes
-    print(f"Detected {NUM_CLASSES} unique fertilizer names: {label_encoder.classes_}")
+        # Define the target column
+        TARGET_COLUMN = 'Fertilizer Name'
 
-    # --- Feature Preprocessing (One-Hot Encoding for categorical) ---
-    # --- Feature Preprocessing with Scaling for numerical ---
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ('num', MinMaxScaler(feature_range=(-1, 1)), numerical_columns),  # Scale numerical features
-            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_columns)
-        ],
-        remainder='drop'  # Drop any columns not explicitly transformed (like 'id' if it wasn't dropped already)
-    )
+        NUMERICAL_COLS = list(df.select_dtypes(include=np.number).columns)
+        CATEGORICAL_COLS = list(df.select_dtypes(exclude=np.number).columns)
+        if TARGET_COLUMN in CATEGORICAL_COLS: CATEGORICAL_COLS.remove(TARGET_COLUMN)
+        # Separate features (X) and target (y)
+        X_features = df.drop(columns=[TARGET_COLUMN])
+        y_labels = df[TARGET_COLUMN]
 
-    # Fit and transform the features
-    X_processed = preprocessor.fit_transform(X)
+        # --- Target Encoding ---
+        # Encode the target variable 'Fertilizer Name' into numerical labels
+        label_encoder = LabelEncoder()
+        y_encoded = pd.Series(label_encoder.fit_transform(y_labels), name=TARGET_COLUMN)
+        NUM_CLASSES = len(label_encoder.classes_)
+        joblib.dump(label_encoder, label_encoder_path)  # Save Label Encoder
 
-    # Determine the input size for the model based on the processed features
-    INPUT_SIZE = X_processed.shape[1]  # Global variable for input_size
-    print(f"Input feature size after preprocessing: {INPUT_SIZE}")
+        # --- Feature Preprocessing (One-Hot Encoding for categorical) ---
+        # --- Feature Preprocessing with Scaling for numerical ---
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', MinMaxScaler(feature_range=(-1, 1)), NUMERICAL_COLS),
+                ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), CATEGORICAL_COLS)
+            ], remainder='passthrough')
 
-    # Combine processed features and encoded labels into a DataFrame for Ray Dataset
-    # We convert the sparse matrix from OneHotEncoder to a dense array for easier handling.
-    processed_data_for_ray = pd.DataFrame(X_processed.toarray() if hasattr(X_processed, 'toarray') else X_processed,
-                                          columns=[f'feature_{i}' for i in range(INPUT_SIZE)])
-    processed_data_for_ray['labels'] = y_encoded
+        preprocessor.fit(X_features)  # Fit preprocessor
+        joblib.dump(preprocessor, preprocessor_path)  # Save Preprocessor
+        print(f"Preprocessor saved to {preprocessor_path}")
 
-    # Convert Pandas DataFrame to Ray Dataset
-    # The `map_batches` step ensures the dataset yields dictionaries with 'features' (NumPy array)
-    # and 'labels' (NumPy array) as expected by iter_torch_batches.
-    ray_dataset = ray.data.from_pandas(processed_data_for_ray)
+        X_processed_np = preprocessor.transform(X_features)
+        feature_names = preprocessor.get_feature_names_out()
+        X_processed = pd.DataFrame(X_processed_np, columns=feature_names)
 
-    # Transform the Ray Dataset to have 'features' (all input columns as a single array) and 'labels'
-    ray_dataset = ray_dataset.map_batches(
-        lambda batch: {
-            "features": batch[[col for col in batch.columns if col.startswith('feature_')]].values.astype(np.float32),
-            "labels": batch["labels"].values.astype(np.int64)  # Labels should be int64 for PyTorch LongTensor
-        },
-        batch_format="pandas"  # Process batches as Pandas DataFrames
-    )
+        # Now you can choose the selection method here
+        X_selected = select_features(X_processed, y_encoded, k=40, method='model')  # Changed to 'model'
+        INPUT_SIZE = X_selected.shape[1]
 
-    # --- Split the Ray Dataset into Train and Test ---
-    # Use .train_test_split() with a test_size of 0.2 (20%)
-    # random_state ensures reproducibility of the split.
-    # train_ray_dataset, test_ray_dataset = ray_dataset.train_test_split(test_size=0.2, shuffle=True, seed=42)
+        # Save the list of selected columns
+        with open(selected_columns_path, 'w') as f:
+            json.dump(X_selected.columns.tolist(), f)
+        print(f"Selected column names saved to {selected_columns_path}")
+
+        # Save the selected features and labels to a CSV file
+        print(f"Saving {X_selected.shape[1]} selected features and labels to CSV...")
+        final_df_to_save = pd.concat([X_selected, y_encoded], axis=1)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_filename = f"selected_features_{timestamp}.csv"
+        final_df_to_save.to_csv(output_filename, index=False)
+        print(f"Data saved to {output_filename}")
 
 
 
-    # Split the Ray Dataset into 80% training and 20% testing sets
-    train_dataset, test_dataset = ray_dataset.train_test_split(test_size=0.2, shuffle=True, seed=42)
+    else:
+        # This block now loads the most recently saved preprocessed file
+        try:
+            list_of_files = glob.glob(os.path.join(output_dir, 'selected_features_*.csv'))
+            if not list_of_files:
+                raise FileNotFoundError("No preprocessed file found. Please run with include_data_prep=True first.")
+            latest_file = max(list_of_files, key=os.path.getctime)
+            print(f"Loading data from most recent file: {latest_file}")
+            loaded_df = pd.read_csv(latest_file)
+            TARGET_COLUMN_NAME = 'Fertilizer Name'
+            if TARGET_COLUMN_NAME not in loaded_df.columns:
+                raise ValueError(f"Target column '{TARGET_COLUMN_NAME}' not found in {latest_file}")
 
-    print(f"\nTotal Ray Dataset created with {ray_dataset.count()} rows.")
-    print(f"Train Ray Dataset created with {train_dataset.count()} rows (80%).")
-    print(f"Test Ray Dataset created with {test_dataset.count()} rows (20%).")
+            y_encoded = loaded_df[TARGET_COLUMN_NAME]
+            X_selected = loaded_df.drop(columns=[TARGET_COLUMN_NAME])
+            INPUT_SIZE = X_selected.shape[1]
+            NUM_CLASSES = len(y_encoded.unique())
 
-    # Example of peeking into the train dataset to verify structure and data types
-    print("\n--- Sample from Training Dataset ---")
-    for i, row in enumerate(train_dataset.take(1)):  # Take only 1 for brevity
-        label_dtype = getattr(row['labels'], 'dtype', type(row['labels']).__name__)
-        print(
-            f"Sample {i + 1}: Features shape {row['features'].shape}, Features dtype: {row['features'].dtype}, Label: {row['labels']}, Label dtype: {label_dtype}")
-        print(f"Sample {i + 1} Features (first 5 elements): {row['features'][:5]}")
+        except Exception as e:
+            print(f"Error loading preprocessed data: {e}")
+            print("Exiting pipeline.")
+            return
 
-    print("\n" + "=" * 50 + "\n")
+    print(f"Final Input feature size after selection: {INPUT_SIZE}, Number of classes: {NUM_CLASSES}")
+    print(f"Data shapes: X={X_selected.shape}, y={y_encoded.shape}")
+
+    # Put data into Ray's object store to be accessed by all trials efficiently
+    X_ref = ray.put(X_selected)
+    y_ref = ray.put(y_encoded)
 
     # 5. Define the Search Space for Hyperparameters
     search_space = {
         "input_size": tune.grid_search([INPUT_SIZE]),  # Fixed based on your data
         "num_classes": tune.grid_search([NUM_CLASSES]),  # Fixed based on your data
         "lr": tune.loguniform(1e-4, 1e-2),  # Sample learning rate logarithmically between 0.0001 and 0.01
-        "batch_size": tune.choice([128, 256, 512]),
+        "batch_size": tune.choice([256, 512, 1024]),
         "dropout_rate": tune.uniform(0.1, 0.5),
         "weight_decay": tune.loguniform(1e-5, 1e-3),
-        "activation_fn": tune.choice(["relu", "leaky_relu", "elu", "gelu", "silu"]),
-        "l1_units": tune.choice([64, 128, 256]),
-        "l2_units": tune.choice([32, 64, 128]),
-        "l3_units": tune.choice([8, 16, 32]),
-        "optimizer": tune.choice(["Adam", "SGD", "AdamW"]),
-        # "num_epochs": 30,  # Fixed number of epochs for each trial for simplicity
-        "num_epochs": 15,  # Number of epochs PER FOLD
-        "n_splits": 5,  # Number of folds for StratifiedKFold (can also be tuned: tune.choice([3, 5]))
-        "fold_seed": tune.randint(0, 1000)  # Optional: vary seed for k-fold split per trial
+        "activation_fn": tune.choice(["leaky_relu", "elu", "gelu", "silu"]),
+        "l1_units": tune.choice([128, 256, 512]),
+        "l2_units": tune.choice([64, 128, 256]),
+        "l3_units": tune.choice([32, 64, 128]),
+        "l4_units": tune.choice([8, 16, 32]),
+        "optimizer": tune.choice(["AdamW"]),
+        "num_epochs": 30, # Num epochs PER FOLD
+        "n_splits": 5,    # Number of folds to use inside the trainable
+        "X_ref": X_ref,
+        "y_ref": y_ref
     }
 
-    USE_GPU = False
-    if torch.cuda.is_available():
-        print("GPU is available!!!!")
-        USE_GPU = True
-
-    # 6. Configure and Run Ray Tune
-    # Use TorchTrainer within the tune.Tuner
-
-    # For StratifiedKFold within each trial, num_workers=1 is often simplest
-    # as the K-fold logic runs sequentially on that one worker.
-    # If you use num_workers > 1, you need a more complex strategy for distributing folds.
-    if USE_GPU:
-        scaling_config = ScalingConfig(num_workers=1, use_gpu=True, resources_per_worker={"CPU": 4, "GPU": 1})
-    else:
-        scaling_config = ScalingConfig(num_workers=1, use_gpu=False,
-                                       resources_per_worker={"CPU": 4})  # Or more CPUs
-
-    trainable = TorchTrainer(
-        train_loop_per_worker=train_func_with_tune,
-        scaling_config=scaling_config,
-        # Pass the FULL dataset. It will be named "dataset" inside train_func_with_tune
-        datasets={"dataset": ray_dataset}
-    )
-
+    # --- Scheduler Setup ---
     scheduler = ASHAScheduler(
-        metric="val_loss",  # This will be average val_loss across folds
-        mode="min",
-        max_t=search_space["num_epochs"] * search_space["n_splits"],  # Max "time" can be total epochs
-        grace_period=search_space["n_splits"],  # Min "time" before stopping (e.g., complete one full CV)
+        max_t=search_space["n_splits"],  # Max "time" is the total number of folds
+        grace_period=2,  # A trial must run for at least 2 folds before being stopped
         reduction_factor=2
     )
 
+    resources = {"cpu": 2}
+    if torch.cuda.is_available():
+        resources = {"cpu": 2, "gpu": 1}
+
     tuner = tune.Tuner(
-        trainable=trainable,
-        param_space={"train_loop_config": search_space},
-        tune_config=tune.TuneConfig(
-            num_samples=10,  # Number of different hyperparameter combinations to try
-            scheduler=scheduler
+        tune.with_resources(train_with_internal_kfold, resources),
+        param_space=search_space,
+        tune_config=TuneConfig(
+            num_samples=20,  # Total number of hyperparameter combinations to test
+            scheduler=scheduler,  # Add the scheduler here
+            metric="val_loss",
+            mode="min"
         ),
-        run_config=RunConfig(
-            name="fertilizer_kfold_experiment",
-            checkpoint_config=tune.CheckpointConfig(
-                # Checkpointing with K-fold is more complex.
-                # You might checkpoint the model after all K folds,
-                # or the best model from one of the folds.
-                # For now, let's assume we checkpoint based on the avg val_loss.
-                checkpoint_score_attribute="val_loss",
-                checkpoint_score_order="min",
-                num_to_keep=1,
-            ),
-        ),
+        run_config=RunConfig(name="fertilizer_internal_kfold_exp_asha")
     )
 
-    # Run the tuning experiment
     results = tuner.fit()
+    best_result = results.get_best_result()
 
-    # Get the best trial
-    best_result = results.get_best_result("val_loss", "min")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    model_filename = os.path.join(output_dir, f"best_model_{timestamp}.pt")
+    best_result_filename = os.path.join(output_dir, f"best_tune_result_{timestamp}.json")
 
-    print(f"\nBest trial found: {best_result.config['train_loop_config']}")
-    print(f"Best trial final validation loss: {best_result.metrics['val_loss']:.4f}")
-    print(f"Best trial final accuracy: {best_result.metrics['accuracy']:.4f}")
-    print(f"Best trial final MAP@3: {best_result.metrics['map_at_3']:.4f}")
+    # Save best config and metrics to JSON
+    best_config_to_save = {k: v for k, v in best_result.config.items() if k not in ['X_ref', 'y_ref']}
+    result_to_save = {
+        'best_config': best_config_to_save,
+        'metrics': best_result.metrics,
+        'model_path': model_filename,
+        'preprocessor_path': preprocessor_path,
+        'label_encoder_path': label_encoder_path,
+        'selected_columns_path': selected_columns_path
+    }
 
-    # Model loading part needs adjustment if checkpointing is done within train_func_with_tune
-    # Ray Train's TorchTrainer handles checkpointing automatically if configured in RunConfig.
-    # The best_result.checkpoint will be a Ray Train Checkpoint object.
+    with open(best_result_filename, 'w') as f:
+        json.dump(result_to_save, f, indent=4)
+    print(f"Best trial results saved to {best_result_filename}")
+
     if best_result.checkpoint:
-        print(f"Best trial checkpoint path: {best_result.checkpoint.path}")
-        # To load a model from a Ray Train checkpoint:
-        # best_checkpoint = best_result.checkpoint
-        # loaded_model_state = best_checkpoint.to_dict() # This loads the state dict
-        # model_to_load = FertilizerClassifier(
-        #     input_size=best_result.config['train_loop_config']["input_size"],
-        #     num_classes=best_result.config['train_loop_config']["num_classes"],
-        #     # ... other model params from best_result.config ...
-        #     l1_units=best_result.config['train_loop_config']["l1_units"],
-        #     l2_units=best_result.config['train_loop_config']["l2_units"],
-        #     dropout_rate=best_result.config['train_loop_config']["dropout_rate"],
-        #     activation_fn_name=best_result.config['train_loop_config']["activation_fn"]
-        # )
-        # model_to_load.load_state_dict(loaded_model_state['model_state_dict']) # Assuming 'model_state_dict' is the key
-        # print("Model loaded from best checkpoint.")
-        # Note: Ray's TorchTrainer saves checkpoints in a specific format.
-        # You might need to adjust how you save/load if you implement manual checkpointing
-        # inside `train_func_with_tune` with `ray.train.report(..., checkpoint=...)`.
-        # The default TorchTrainer checkpoint will contain the model state dict.
-        # For simplicity, the loading part is commented out as it depends on how
-        # FertilizerClassifier and checkpointing are precisely set up.
-        # The key is that `best_result.checkpoint` gives you access.
+        best_checkpoint_dict = best_result.checkpoint.to_dict()
+        model_state_dict = best_checkpoint_dict["model_state_dict"]
+        torch.save(model_state_dict, model_filename)
+        print(f"Saved best model state to {model_filename}")
     else:
-        print("No checkpoint found for the best trial.")
+        print("No checkpoint found for the best trial. Could not save model.")
 
+    print("\n" + "=" * 50)
+    print("Ray Tune with Internal K-Fold Finished!")
+    print("=" * 50)
+    print(f"Best trial's final average validation loss: {best_result.metrics['val_loss']:.4f}")
+    print(f"Best trial's final average accuracy: {best_result.metrics['accuracy']:.4f}")
+    print(f"Best trial's final average F1 Score: {best_result.metrics['f1_score']:.4f}")
+    print("\nBest hyperparameters found:")
+    print(best_config_to_save)
     ray.shutdown()
 
-    print(f"\nBest trial found: {best_result.config}")
-    print(f"Best trial final validation loss: {best_result.metrics['val_loss']:.4f}")
-    print(f"Best trial final accuracy: {best_result.metrics['accuracy']:.4f}")
+    try:
+        list_of_configs = glob.glob(os.path.join(output_dir, 'best_tune_result_*.json'))
+        latest_config_file = max(list_of_configs, key=os.path.getctime)
+        with open(latest_config_file, 'r') as f:
+            saved_data = json.load(f)
+            latest_model_file = saved_data['model_path']
+        if os.path.exists(latest_model_file) and os.path.exists('../data/train.csv'):
+            create_submission_file(
+                test_data_path='../data/train.csv',
+                submission_path="submission.csv",
+                model_path=latest_model_file,
+                config_path=latest_config_file,
+                preprocessor_path=saved_data['preprocessor_path'],
+                label_encoder_path=saved_data['label_encoder_path'],
+                selected_columns_path=saved_data['selected_columns_path']
+            )
+        else:
+            print("\nCould not create submission file: model or test data not found.")
+    except (ValueError, FileNotFoundError) as e:
+        print(f"\nCould not load a saved model or create submission: {e}")
 
-    # You can also access the best model checkpoint if you configured checkpointing in your train_func_with_tune
-    if best_result.path:
-        print(f"Best trial checkpoint path: {best_result.path}")
-        # You would load the model from this checkpoint for inference
-        model_to_load = FertilizerClassifier(
-            input_size=best_result.config['train_loop_config']["input_size"],
-            num_classes=best_result.config['train_loop_config']["num_classes"],
-            # ... other model params from best_result.config ...
-            l1_units=best_result.config['train_loop_config']["l1_units"],
-            l2_units=best_result.config['train_loop_config']["l2_units"],
-            dropout_rate=best_result.config['train_loop_config']["dropout_rate"],
-            activation_fn_name=best_result.config['train_loop_config']["activation_fn"]
-        )
-        model_to_load.load_state_dict(torch.load(os.path.join(best_result.path, "model.pt")))
+if __name__ == '__main__':
+    pipeline(include_data_prep=True)
