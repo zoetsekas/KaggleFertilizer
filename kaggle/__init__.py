@@ -1,66 +1,75 @@
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import RFE, SelectFromModel, SelectKBest, f_classif
 from torch import nn
 
 
 class FertilizerClassifier(nn.Module):
-    def __init__(self, input_size, num_classes, l1_units, l2_units, l3_units, l4_units, dropout_rate, activation_fn_name):
+    def __init__(self, num_numerical_features, categorical_cardinalities, embedding_dim, num_hidden_layers, hidden_units,
+                 num_classes, dropout_rate, activation_fn_name):
         super().__init__()
-        self.fc1 = nn.Linear(input_size, l1_units)
-        self.bn1 = nn.BatchNorm1d(l1_units)
 
-        self.fc2 = nn.Linear(l1_units, l2_units)
-        self.bn2 = nn.BatchNorm1d(l2_units)
+        self.num_numerical_features = num_numerical_features
+        self.activation_fn_name = activation_fn_name
+        self.__get_activation_function__()
 
-        self.fc3 = nn.Linear(l2_units, l3_units)
-        self.bn3 = nn.BatchNorm1d(l3_units)
+        # Create a ModuleList to hold the embedding layers
+        self.embedding_layers = nn.ModuleList(
+            [nn.Embedding(num_categories, embedding_dim) for num_categories in categorical_cardinalities]
+        )
 
-        self.fc4 = nn.Linear(l3_units, l4_units)
-        self.bn4 = nn.BatchNorm1d(l4_units)
+        # Calculate the total size of the concatenated features (numerical + embedded categorical)
+        total_embedding_dim = len(categorical_cardinalities) * embedding_dim
+        combined_input_size = num_numerical_features + total_embedding_dim
 
-        self.fc5 = nn.Linear(l4_units, num_classes) # Final layer
+        layers = []
+        in_features = combined_input_size
 
-        self.dropout = nn.Dropout(dropout_rate)
+        # Dynamically create hidden layers
+        for i in range(num_hidden_layers):
+            layers.append(nn.Linear(in_features, hidden_units))
+            layers.append(nn.BatchNorm1d(hidden_units))
+            layers.append(self.activation)
+            layers.append(nn.Dropout(dropout_rate))
+            in_features = hidden_units  # The input of the next layer is the output of this one
 
+        # Add the final output layer
+        layers.append(nn.Linear(in_features, num_classes))
+
+        # Create the sequential network from the list of layers
+        self.network = nn.Sequential(*layers)
+
+    def __get_activation_function__(self):
         # Select activation function based on string name
-        if activation_fn_name == "relu":
+        if self.activation_fn_name == "relu":
             self.activation = nn.ReLU()
-        elif activation_fn_name == "leaky_relu":
+        elif self.activation_fn_name == "leaky_relu":
             self.activation = nn.LeakyReLU()
-        elif activation_fn_name == "elu":
+        elif self.activation_fn_name == "elu":
             self.activation = nn.ELU()
-        elif activation_fn_name == "gelu":
+        elif self.activation_fn_name == "gelu":
             self.activation = nn.GELU()
-        elif activation_fn_name == "silu":
+        elif self.activation_fn_name == "silu":
             self.activation = nn.SiLU()
         else:
-            raise ValueError(f"Unknown activation function: {activation_fn_name}")
+            raise ValueError(f"Unknown activation function: {self.activation_fn_name}")
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = self.activation(x)
-        x = self.dropout(x)
+        # Split the input tensor into numerical and categorical parts
+        x_numerical = x[:, :self.num_numerical_features]
+        x_categorical = x[:, self.num_numerical_features:].long()
 
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = self.activation(x)
-        x = self.dropout(x)
+        # Get embeddings for each categorical feature
+        embedded_cats = [
+            self.embedding_layers[i](x_categorical[:, i]) for i in range(x_categorical.shape[1])
+        ]
 
-        x = self.fc3(x)
-        x = self.bn3(x)
-        x = self.activation(x)
-        x = self.dropout(x)
+        # Concatenate numerical features with the embedded categorical features
+        x_combined = torch.cat([x_numerical] + embedded_cats, dim=1)
 
-        x = self.fc4(x)
-        x = self.bn4(x)
-        x = self.activation(x)
-        x = self.dropout(x)
-
-        x = self.fc5(x) # Output logits
-        return x
+        return self.network(x_combined)
 
 def round_to_half(x):
     return round(x * 2) / 2
@@ -126,10 +135,12 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df['Potassium_Binned'] = pd.cut(df['Potassium'], bins=4, labels=['Low_K', 'Medium_K', 'High_K', 'Very_High_K'])
     df['Phosphorous_Binned'] = pd.cut(df['Phosphorous'], bins=4, labels=['Low_P', 'Medium_P', 'High_P', 'Very_High_P'])
 
+    df.drop(columns=['Temparature', 'Humidity', 'Moisture', 'Nitrogen', 'Potassium', 'Phosphorous', 'Total_NPK'], inplace=True)
+
     return df
 
 
-def select_features(x_df, y_series, k=45, method='model'):
+def select_features(x_df, y_series, k=20, method='model'):
     """
     Selects the K best features using one of several methods.
 

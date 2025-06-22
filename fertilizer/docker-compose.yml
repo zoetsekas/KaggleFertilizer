@@ -1,27 +1,8 @@
 services:
-  trading_db:
-    container_name: trading-db
-    image: postgres
+  fertilizer_app:
     env_file: ../system.env
-    ports:
-      - "${DATABASE_PORT}:5432"
-    shm_size: '4gb'
-    restart: always
-    volumes:
-#      - ${HOME_DIR}/postgres/postgres_data456:/var/lib/postgresql/data
-      - D:\data\trading\postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: [ "CMD-SHELL", "sh -c 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}'" ]
-      interval: 1s
-      timeout: 5s
-      retries: 10
-    networks:
-      - trading_network
-  trading_data_app:
-    env_file: ../system.env
-    container_name: trading-data-app
+    container_name: fertilizer-app
     image: ${IMAGE_NAME}:${IMAGE_TAG}
-#    command: --action=train_ma_ppo_equity --execution=docker
     deploy:
       resources:
         reservations:
@@ -30,110 +11,14 @@ services:
               count: 1
               capabilities: [ gpu ]
     build:
-      context: .
-      args:
-        - EOD_HISTORICAL_DATA_API_KEY
       shm_size: '11gb'
-      dockerfile: ./trading.Dockerfile
-#    command: "python /trading/data/main.py  --action=print_env"
+      dockerfile: ./.Dockerfile
     ports:
       - "8000:8000"
     volumes:
       - D:\data\trading\portfolio:/var/local/portfolio
-#      - ${HOME_DIR}/ray_results:/root/ray_results
       - D:\data\trading\ray_results:/root/ray_results
       - D:\data\trading\ray_checkpoints:/root/ray_checkpoints
       - D:\data\trading\ray_tmp:/tmp/ray
-#      - ray_results:/root/ray_results
-#      - trading-code:/usr/local/src/trading
-#      - trading-logs:/var/log/trading
-#      - trading-training:/usr/share/training
-    networks:
-      - trading_network
-    depends_on:
-      - trading_db
-  trading_serving_app:
-    env_file: ../system.env
-    container_name: trading-serving-app
-    image: ${IMAGE_NAME}:${IMAGE_TAG}
-    command: --action=serve_ma_ppo_equity --checkpoint_dir=/root/ray_checkpoints --execution=docker
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [ gpu ]
-    build:
-      context: .
-      args:
-        - EOD_HISTORICAL_DATA_API_KEY
-      shm_size: '11gb'
-      dockerfile: ./trading.Dockerfile
-    ports:
-      - "9995:8000"
-    volumes:
-      - D:\data\trading\portfolio:/var/local/portfolio
-#      - ${HOME_DIR}/ray_results:/root/ray_results
-      - D:\data\trading\ray_results:/root/ray_results
-      - D:\data\trading\ray_checkpoints:/root/ray_checkpoints
-      - D:\data\trading\ray_tmp:/tmp/ray
-#      - ray_results:/root/ray_results
-#      - trading-code:/usr/local/src/trading
-#      - trading-logs:/var/log/trading
-#      - trading-training:/usr/share/training
-    networks:
-      - trading_network
-    depends_on:
-      - trading_db
-  jupyter_app:
-    env_file: ../system.env
-    container_name: jupyter-app
-    image: ${JUPYTER_IMAGE_NAME}:${JUPYTER_IMAGE_TAG}
-#    command: jupyter lab --ip=0.0.0.0 --port=8888 --allow-root
-    build:
-      context: .
-      dockerfile: jupyter.Dockerfile
-    ports:
-      - "9999:8888"
-    volumes:
-      - ../notebooks:/var/local/notebooks
-      - D:\data\trading\portfolio:/var/local/portfolio
-    working_dir: /var/local/
-    networks:
-      - trading_network
-    depends_on:
-      - trading_db
-  tensorboard_app:
-    env_file: ../system.env
-    container_name: tensorboard-app
-    image: ${TENSORBOARD_IMAGE_NAME}:${TENSORBOARD_IMAGE_TAG}
-    restart: always
-    command: tensorboard --host 0.0.0.0 --port 6006 --logdir=/var/local/ray_results
-    build:
-      context: .
-      dockerfile: tensorboard.Dockerfile
-    ports:
-      - "9906:6006"
-    volumes:
-#      - ${HOME_DIR}/ray_results:/var/local/ray_results
-#      - /home/zoe/ray_results:/var/local/ray_results
-#      - \\wsl.localhost\Ubuntu-22.04\home\zoe\ray_results:/var/local/ray_results
-      - D:\data\trading\ray_results:/var/local/ray_results
-      - D:\data\trading\ray_checkpoints:/root/ray_checkpoints
-      - D:\data\trading\ray_tmp:/tmp/ray
-    working_dir: /var/local/ray_results
-#volumes:
-#  postgres-data2:
-#    driver: local
-##    external: true
-#    driver_opts:
-#      o: bind
-#      type: none
-#      device: /home/zoe/postgres/postgres_data
 volumes:
   ray_results:
-networks:
-  trading_network:
-    driver: bridge
-    name: trading_network

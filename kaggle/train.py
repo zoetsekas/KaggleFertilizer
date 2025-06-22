@@ -10,12 +10,12 @@ import ray
 import torch
 import torch.nn as nn
 from ray import tune
-from ray.tune import RunConfig, report, TuneConfig
+from ray.tune import RunConfig, report, TuneConfig, Checkpoint
 from ray.tune.schedulers import ASHAScheduler
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -37,6 +37,9 @@ def train_with_internal_kfold(config):
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
     fold_metrics = []
+    best_fold_map_at_3 = -1.0  # Initialize to a low value for maximization
+    best_model_state_for_trial = None
+    avg_metrics = {}
 
     # --- Loop over each fold ---
     for fold_idx, (train_index, val_index) in enumerate(skf.split(X_kfold, y_kfold)):
@@ -56,18 +59,24 @@ def train_with_internal_kfold(config):
         # --- Re-initialize Model and Optimizer for each fold ---
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = FertilizerClassifier(
-            input_size=config["input_size"],
+            num_numerical_features=config["num_numerical_features"],
+            categorical_cardinalities=config["categorical_cardinalities"],
+            embedding_dim=config["embedding_dim"],
             num_classes=config["num_classes"],
-            l1_units=config["l1_units"],
-            l2_units=config["l2_units"],
-            l3_units=config["l3_units"],
-            l4_units=config["l4_units"],
+            num_hidden_layers=config["num_hidden_layers"],
+            hidden_units=config["hidden_units"],
             dropout_rate=config["dropout_rate"],
             activation_fn_name=config["activation_fn"]
         ).to(device)
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
-        loss_fn = nn.CrossEntropyLoss()
+
+        if config["loss_function"] == "CrossEntropyLoss":
+            loss_fn = nn.CrossEntropyLoss()
+        elif config["loss_function"] == "CosineEmbeddingLoss":
+            loss_fn = nn.CosineEmbeddingLoss()
+        else:
+            raise ValueError(f"Unknown loss function: {config['loss_function']}")
 
         # --- Training Loop for the current fold ---
         for epoch in range(config["num_epochs"]):
@@ -114,10 +123,14 @@ def train_with_internal_kfold(config):
             "f1_score": fold_f1
         })
         print(
-            f"--- Fold {fold_idx + 1} Metrics: Val Loss: {fold_avg_val_loss:.4f}, Accuracy: {fold_accuracy:.4f}, F1: {fold_f1:.4f} ---")
+            f"--- Fold {fold_idx + 1} Metrics: Val Loss: {fold_avg_val_loss:.4f}, Accuracy: {fold_accuracy:.4f}, MAP@3: {fold_map_at_3:.4f} ---")
+
+        # Check if this fold's model is the best one seen so far in this trial based on MAP@3
+        if fold_map_at_3 > best_fold_map_at_3:
+            best_fold_map_at_3 = fold_map_at_3
+            best_model_state_for_trial = model.state_dict()
 
         # --- Report CUMULATIVE average metrics to Ray Tune after each fold ---
-        # This makes the trial compatible with early-stopping schedulers like ASHAScheduler
         avg_metrics = {
             "val_loss": np.mean([m["val_loss"] for m in fold_metrics]),
             "accuracy": np.mean([m["accuracy"] for m in fold_metrics]),
@@ -126,18 +139,17 @@ def train_with_internal_kfold(config):
         }
         report(avg_metrics)
 
+    # --- After all folds, create a final checkpoint from the best model state ---
+    if best_model_state_for_trial:
+        checkpoint = Checkpoint.from_dict({"model_state_dict": best_model_state_for_trial})
+        # The last reported metrics will be the final ones for the trial.
+        # We report them again here with the checkpoint.
+        report(metrics=avg_metrics, checkpoint=checkpoint)
+
 
 def load_best_model(config_path, model_path, device="cpu"):
     """
     Loads the best model from a saved state dictionary and configuration file.
-
-    Args:
-        config_path (str): Path to the best_tune_result.json file.
-        model_path (str): Path to the best_model.pt file.
-        device (str): The device to load the model onto ('cpu' or 'cuda').
-
-    Returns:
-        torch.nn.Module: The loaded model, ready for inference.
     """
     print(f"Loading model configuration from: {config_path}")
     with open(config_path, 'r') as f:
@@ -147,14 +159,14 @@ def load_best_model(config_path, model_path, device="cpu"):
 
     print("Instantiating model with the best hyperparameters...")
     model = FertilizerClassifier(
-        input_size=best_config["input_size"],
-        num_classes=best_config["num_classes"],
-        l1_units=best_config["l1_units"],
-        l2_units=best_config["l2_units"],
-        l3_units=best_config["l3_units"],
-        l4_units=best_config["l4_units"],
+        num_numerical_features=best_config["num_numerical_features"],
+        categorical_cardinalities=best_config["categorical_cardinalities"],
+        embedding_dim=best_config["embedding_dim"],
+        num_hidden_layers=best_config["num_hidden_layers"],
+        hidden_units=best_config["hidden_units"],
         dropout_rate=best_config["dropout_rate"],
-        activation_fn_name=best_config["activation_fn"]
+        activation_fn_name=best_config["activation_fn"],
+        num_classes=best_config["num_classes"]
     )
 
     print(f"Loading model state from: {model_path}")
@@ -162,8 +174,7 @@ def load_best_model(config_path, model_path, device="cpu"):
     model.load_state_dict(model_state_dict)
 
     model.to(device)
-    model.eval()  # Set the model to evaluation mode
-
+    model.eval()
     print("Model loaded successfully and set to evaluation mode.")
     return model
 
@@ -177,46 +188,30 @@ def create_submission_file(test_data_path, submission_path, model_path, config_p
     print("\n--- Creating Submission File ---")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --- Load all necessary artifacts ---
     model = load_best_model(config_path, model_path, device)
     preprocessor = joblib.load(preprocessor_path)
-    label_encoder = joblib.load(label_encoder_path)
+    target_label_encoder = joblib.load(label_encoder_path)
     with open(selected_columns_path, 'r') as f:
         selected_columns = json.load(f)
 
-    # --- Load and Preprocess Test Data ---
     print(f"Loading test data from {test_data_path}")
     test_df = pd.read_csv(test_data_path)
-    # Keep the 'id' column for the final submission file
     test_ids = test_df['id']
 
     print("Applying feature engineering to test data...")
-    test_df = add_features(test_df)
-
-    # Ensure test set has all columns needed for preprocessor, add missing ones with 0
-    training_cols = preprocessor.feature_names_in_
-    for col in training_cols:
-        if col not in test_df.columns:
-            test_df[col] = 0
-    test_df = test_df[training_cols]  # Ensure order is the same
+    test_df_features = add_features(test_df.drop(columns=['id']))
 
     print("Applying preprocessing to test data...")
-    X_test_processed_np = preprocessor.transform(test_df)
-
-    # Get feature names from the preprocessor
+    X_test_processed_np = preprocessor.transform(test_df_features)
     feature_names = preprocessor.get_feature_names_out()
     X_test_processed = pd.DataFrame(X_test_processed_np, columns=feature_names)
-
-    # Filter to only the columns the model was trained on
     X_test_selected = X_test_processed[selected_columns]
 
-    # --- Make Predictions ---
     print("Making predictions on the test set...")
     X_test_tensor = torch.from_numpy(X_test_selected.values).float().to(device)
 
     all_predictions = []
     with torch.no_grad():
-        # Process in batches to avoid memory issues with large test sets
         test_dataset = TensorDataset(X_test_tensor)
         test_loader = DataLoader(test_dataset, batch_size=512)
         for batch in test_loader:
@@ -225,15 +220,9 @@ def create_submission_file(test_data_path, submission_path, model_path, config_p
             _, predicted_indices = torch.max(outputs, 1)
             all_predictions.extend(predicted_indices.cpu().numpy())
 
-    # Inverse transform the predicted indices to get the original fertilizer names
-    predicted_fertilizer_names = label_encoder.inverse_transform(all_predictions)
+    predicted_fertilizer_names = target_label_encoder.inverse_transform(all_predictions)
 
-    # --- Create and Save Submission File ---
-    submission_df = pd.DataFrame({
-        'id': test_ids,
-        'Fertilizer Name': predicted_fertilizer_names
-    })
-
+    submission_df = pd.DataFrame({'id': test_ids, 'Fertilizer Name': predicted_fertilizer_names})
     submission_df.to_csv(submission_path, index=False)
     print(f"Submission file created successfully at: {submission_path}")
 
@@ -249,11 +238,16 @@ def pipeline(include_data_prep:bool=True, artifacts_dir: str = "run_artifacts"):
     label_encoder_path = os.path.join(output_dir, "label_encoder.joblib")
     selected_columns_path = os.path.join(output_dir, "selected_columns.json")
 
+    num_numerical_features = None
+    final_categorical_cardinalities = None
+    X_final_for_tune = None
+    y_encoded = None
+    NUM_CLASSES = None
+
     if include_data_prep:
         df1 = pd.read_csv('../data/train.csv')
         df2 = pd.read_csv('../data/Fertilizer_Prediction.csv')
         df = pd.concat([df1, df2], ignore_index=True)
-
         df = df.drop(columns=['id'])
 
         # Preprocessing
@@ -262,10 +256,8 @@ def pipeline(include_data_prep:bool=True, artifacts_dir: str = "run_artifacts"):
         # Drop the duplicate rows
         df = df.drop_duplicates()
 
-
         # Define the target column
         TARGET_COLUMN = 'Fertilizer Name'
-
         NUMERICAL_COLS = list(df.select_dtypes(include=np.number).columns)
         CATEGORICAL_COLS = list(df.select_dtypes(exclude=np.number).columns)
         if TARGET_COLUMN in CATEGORICAL_COLS: CATEGORICAL_COLS.remove(TARGET_COLUMN)
@@ -275,92 +267,89 @@ def pipeline(include_data_prep:bool=True, artifacts_dir: str = "run_artifacts"):
 
         # --- Target Encoding ---
         # Encode the target variable 'Fertilizer Name' into numerical labels
-        label_encoder = LabelEncoder()
-        y_encoded = pd.Series(label_encoder.fit_transform(y_labels), name=TARGET_COLUMN)
-        NUM_CLASSES = len(label_encoder.classes_)
-        joblib.dump(label_encoder, label_encoder_path)  # Save Label Encoder
+        target_label_encoder = LabelEncoder()
+        y_encoded = pd.Series(target_label_encoder.fit_transform(y_labels), name=TARGET_COLUMN)
+        NUM_CLASSES = len(target_label_encoder.classes_)
+        joblib.dump(target_label_encoder, label_encoder_path)
+        print(f"Target Label Encoder saved to {label_encoder_path}")
 
-        # --- Feature Preprocessing (One-Hot Encoding for categorical) ---
+        # --- Feature Preprocessing (OrdinalEncoder for categorical) ---
         # --- Feature Preprocessing with Scaling for numerical ---
+        # Using OrdinalEncoder instead of OneHotEncoder
         preprocessor = ColumnTransformer(
             transformers=[
                 ('num', MinMaxScaler(feature_range=(-1, 1)), NUMERICAL_COLS),
-                ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), CATEGORICAL_COLS)
+                ('cat', OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=-1), CATEGORICAL_COLS)
             ], remainder='passthrough')
 
-        preprocessor.fit(X_features)  # Fit preprocessor
+        X_processed_np = preprocessor.fit_transform(X_features)  # Fit preprocessor
         joblib.dump(preprocessor, preprocessor_path)  # Save Preprocessor
         print(f"Preprocessor saved to {preprocessor_path}")
 
-        X_processed_np = preprocessor.transform(X_features)
-        feature_names = preprocessor.get_feature_names_out()
+        # Get cardinalities for embedding layers
+        categorical_cardinalities = [len(cat) for cat in preprocessor.named_transformers_['cat'].categories_]
+
+        feature_names = list(preprocessor.get_feature_names_out())
         X_processed = pd.DataFrame(X_processed_np, columns=feature_names)
 
-        # Now you can choose the selection method here
-        X_selected = select_features(X_processed, y_encoded, k=40, method='model')  # Changed to 'model'
-        INPUT_SIZE = X_selected.shape[1]
+        X_selected = X_processed
 
-        # Save the list of selected columns
-        with open(selected_columns_path, 'w') as f:
-            json.dump(X_selected.columns.tolist(), f)
-        print(f"Selected column names saved to {selected_columns_path}")
+        # X_selected = select_features(X_processed, y_encoded, k=40, method='model')
+        #
+        # with open(selected_columns_path, 'w') as f:
+        #     json.dump(X_selected.columns.tolist(), f)
+        # print(f"Selected column names saved to {selected_columns_path}")
 
-        # Save the selected features and labels to a CSV file
-        print(f"Saving {X_selected.shape[1]} selected features and labels to CSV...")
-        final_df_to_save = pd.concat([X_selected, y_encoded], axis=1)
+        # After selection, re-calculate the info needed for the model
+        final_numerical_cols = [col for col in X_selected.columns if col.startswith('num__')]
+        final_categorical_cols = [col for col in X_selected.columns if col.startswith('cat__')]
+
+        num_numerical_features = len(final_numerical_cols)
+
+        # We need to map the selected categorical columns back to their original cardinalities
+        # First get the original names from the processed names
+        original_cat_names_from_selected = [col.split('__')[-1] for col in final_categorical_cols]
+        # Then find the index of these original names in the full list of categorical columns
+        final_cat_indices = [CATEGORICAL_COLS.index(name) for name in original_cat_names_from_selected]
+        # Use these indices to get the correct cardinalities
+        final_categorical_cardinalities = [categorical_cardinalities[i] for i in final_cat_indices]
+
+        # Re-combine numerical and categorical for the final dataset, ensuring correct order
+        X_final_for_tune = X_selected[final_numerical_cols + final_categorical_cols]
+
+        print(f"Saving {X_final_for_tune.shape[1]} selected features and labels to CSV...")
+        final_df_to_save = pd.concat([X_final_for_tune.reset_index(drop=True), y_encoded.reset_index(drop=True)],
+                                     axis=1)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_filename = f"selected_features_{timestamp}.csv"
+        output_filename = os.path.join(output_dir, f"selected_features_{timestamp}.csv")
         final_df_to_save.to_csv(output_filename, index=False)
         print(f"Data saved to {output_filename}")
-
-
-
     else:
-        # This block now loads the most recently saved preprocessed file
-        try:
-            list_of_files = glob.glob(os.path.join(output_dir, 'selected_features_*.csv'))
-            if not list_of_files:
-                raise FileNotFoundError("No preprocessed file found. Please run with include_data_prep=True first.")
-            latest_file = max(list_of_files, key=os.path.getctime)
-            print(f"Loading data from most recent file: {latest_file}")
-            loaded_df = pd.read_csv(latest_file)
-            TARGET_COLUMN_NAME = 'Fertilizer Name'
-            if TARGET_COLUMN_NAME not in loaded_df.columns:
-                raise ValueError(f"Target column '{TARGET_COLUMN_NAME}' not found in {latest_file}")
+        pass
 
-            y_encoded = loaded_df[TARGET_COLUMN_NAME]
-            X_selected = loaded_df.drop(columns=[TARGET_COLUMN_NAME])
-            INPUT_SIZE = X_selected.shape[1]
-            NUM_CLASSES = len(y_encoded.unique())
+    print(
+        f"Final Input: {num_numerical_features} numerical features, {len(final_categorical_cardinalities)} categorical features.")
 
-        except Exception as e:
-            print(f"Error loading preprocessed data: {e}")
-            print("Exiting pipeline.")
-            return
-
-    print(f"Final Input feature size after selection: {INPUT_SIZE}, Number of classes: {NUM_CLASSES}")
-    print(f"Data shapes: X={X_selected.shape}, y={y_encoded.shape}")
-
-    # Put data into Ray's object store to be accessed by all trials efficiently
-    X_ref = ray.put(X_selected)
+    X_ref = ray.put(X_final_for_tune)
     y_ref = ray.put(y_encoded)
 
     # 5. Define the Search Space for Hyperparameters
     search_space = {
-        "input_size": tune.grid_search([INPUT_SIZE]),  # Fixed based on your data
-        "num_classes": tune.grid_search([NUM_CLASSES]),  # Fixed based on your data
+        "num_numerical_features": num_numerical_features,
+        "categorical_cardinalities": final_categorical_cardinalities,
+        "embedding_dim": tune.choice([8, 16]),
+        "num_classes": NUM_CLASSES,
         "lr": tune.loguniform(1e-4, 1e-2),  # Sample learning rate logarithmically between 0.0001 and 0.01
         "batch_size": tune.choice([256, 512, 1024]),
         "dropout_rate": tune.uniform(0.1, 0.5),
         "weight_decay": tune.loguniform(1e-5, 1e-3),
-        "activation_fn": tune.choice(["leaky_relu", "elu", "gelu", "silu"]),
-        "l1_units": tune.choice([128, 256, 512]),
-        "l2_units": tune.choice([64, 128, 256]),
-        "l3_units": tune.choice([32, 64, 128]),
-        "l4_units": tune.choice([8, 16, 32]),
+        "activation_fn": tune.choice(["leaky_relu", "gelu", "silu"]),
+        "num_hidden_layers": tune.choice([4, 6, 8]),
+        "hidden_units": tune.choice([64, 128, 256]),
         "optimizer": tune.choice(["AdamW"]),
+        "loss_function": tune.choice(["CrossEntropyLoss"]),
         "num_epochs": 30, # Num epochs PER FOLD
-        "n_splits": 5,    # Number of folds to use inside the trainable
+        "n_splits": 10,    # Number of folds to use inside the trainable
         "X_ref": X_ref,
         "y_ref": y_ref
     }
@@ -372,18 +361,18 @@ def pipeline(include_data_prep:bool=True, artifacts_dir: str = "run_artifacts"):
         reduction_factor=2
     )
 
-    resources = {"cpu": 2}
+    resources = {"cpu": 8}
     if torch.cuda.is_available():
-        resources = {"cpu": 2, "gpu": 1}
+        resources = {"cpu": 8, "gpu": 1}
 
     tuner = tune.Tuner(
         tune.with_resources(train_with_internal_kfold, resources),
         param_space=search_space,
         tune_config=TuneConfig(
-            num_samples=20,  # Total number of hyperparameter combinations to test
+            num_samples=5,  # Total number of hyperparameter combinations to test
             scheduler=scheduler,  # Add the scheduler here
-            metric="val_loss",
-            mode="min"
+            metric="map_at_3",
+            mode="max"
         ),
         run_config=RunConfig(name="fertilizer_internal_kfold_exp_asha")
     )
@@ -434,9 +423,9 @@ def pipeline(include_data_prep:bool=True, artifacts_dir: str = "run_artifacts"):
         with open(latest_config_file, 'r') as f:
             saved_data = json.load(f)
             latest_model_file = saved_data['model_path']
-        if os.path.exists(latest_model_file) and os.path.exists('../data/train.csv'):
+        if os.path.exists(latest_model_file) and os.path.exists('../data/test.csv'):
             create_submission_file(
-                test_data_path='../data/train.csv',
+                test_data_path='../data/test.csv',
                 submission_path="submission.csv",
                 model_path=latest_model_file,
                 config_path=latest_config_file,
