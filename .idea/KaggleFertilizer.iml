@@ -2,9 +2,14 @@
 <module type="PYTHON_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/kaggle" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/.idea/dataSources" />
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/.virtual_documents" />
+      <excludeFolder url="file://$MODULE_DIR$/kaggle/run_artifacts" />
+      <excludeFolder url="file://$MODULE_DIR$/notebooks/tensorboard_logs" />
     </content>
-    <orderEntry type="jdk" jdkName="Remote Python 3.12.8 Docker (trading:1.0.16) (2)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Remote Python 3.11.13 Docker (machine-learning:1.0.1)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

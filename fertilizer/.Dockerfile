@@ -1,4 +1,4 @@
-FROM gcr.io/kaggle-gpu-images/python AS build_base
+FROM python:3.12.8-bookworm AS build_base
 
 LABEL authors="Zoe Tsekas"
 RUN echo "building base"
@@ -14,8 +14,6 @@ RUN pip install "ray[all]"
 RUN pip install gymnasium
 RUN pip install jsonschema
 RUN pip install scikit-learn
-RUN pip install schema
-RUN pip install pandas-market-calendars
 RUN pip install pandas -U
 RUN pip install torch --index-url https://download.pytorch.org/whl/cu128
 RUN pip install gputil

@@ -7,26 +7,30 @@ from torch import nn
 
 
 class FertilizerClassifier(nn.Module):
-    def __init__(self, num_numerical_features, categorical_cardinalities, embedding_dim, num_hidden_layers, hidden_units,
-                 num_classes, dropout_rate, activation_fn_name):
+    def __init__(self, input_size, num_numerical_features, categorical_cardinalities, embedding_dim, num_hidden_layers, hidden_units,
+                 num_classes, dropout_rate, activation_fn):
         super().__init__()
 
-        self.num_numerical_features = num_numerical_features
-        self.activation_fn_name = activation_fn_name
+        self.activation_fn_name = activation_fn
         self.__get_activation_function__()
+        self.input_size = input_size
+        if self.input_size is None:
+            self.num_numerical_features = num_numerical_features
 
-        # Create a ModuleList to hold the embedding layers
-        self.embedding_layers = nn.ModuleList(
-            [nn.Embedding(num_categories, embedding_dim) for num_categories in categorical_cardinalities]
-        )
+            # Create a ModuleList to hold the embedding layers
+            self.embedding_layers = nn.ModuleList(
+                [nn.Embedding(num_categories, embedding_dim) for num_categories in categorical_cardinalities]
+            )
 
-        # Calculate the total size of the concatenated features (numerical + embedded categorical)
-        total_embedding_dim = len(categorical_cardinalities) * embedding_dim
-        combined_input_size = num_numerical_features + total_embedding_dim
+            # Calculate the total size of the concatenated features (numerical + embedded categorical)
+            total_embedding_dim = len(categorical_cardinalities) * embedding_dim
+            combined_input_size = num_numerical_features + total_embedding_dim
+
+            in_features = combined_input_size
+        else:
+            in_features = input_size
 
         layers = []
-        in_features = combined_input_size
-
         # Dynamically create hidden layers
         for i in range(num_hidden_layers):
             layers.append(nn.Linear(in_features, hidden_units))
@@ -37,6 +41,8 @@ class FertilizerClassifier(nn.Module):
 
         # Add the final output layer
         layers.append(nn.Linear(in_features, num_classes))
+        # Add a Softmax layer to get probability outputs
+        layers.append(nn.Softmax(dim=1))
 
         # Create the sequential network from the list of layers
         self.network = nn.Sequential(*layers)
@@ -57,19 +63,23 @@ class FertilizerClassifier(nn.Module):
             raise ValueError(f"Unknown activation function: {self.activation_fn_name}")
 
     def forward(self, x):
-        # Split the input tensor into numerical and categorical parts
-        x_numerical = x[:, :self.num_numerical_features]
-        x_categorical = x[:, self.num_numerical_features:].long()
 
-        # Get embeddings for each categorical feature
-        embedded_cats = [
-            self.embedding_layers[i](x_categorical[:, i]) for i in range(x_categorical.shape[1])
-        ]
+        if self.input_size is None:
+            # Split the input tensor into numerical and categorical parts
+            x_numerical = x[:, :self.num_numerical_features]
+            x_categorical = x[:, self.num_numerical_features:].long()
 
-        # Concatenate numerical features with the embedded categorical features
-        x_combined = torch.cat([x_numerical] + embedded_cats, dim=1)
+            # Get embeddings for each categorical feature
+            embedded_cats = [
+                self.embedding_layers[i](x_categorical[:, i]) for i in range(x_categorical.shape[1])
+            ]
 
-        return self.network(x_combined)
+            # Concatenate numerical features with the embedded categorical features
+            x_combined = torch.cat([x_numerical] + embedded_cats, dim=1)
+            return self.network(x_combined)
+        else:
+            return self.network(x)
+
 
 def round_to_half(x):
     return round(x * 2) / 2
@@ -95,6 +105,44 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds several new features based on existing data to improve model performance.
     """
+    # Feature 1: Crop Nutrient Requirement Scores
+    crop_needs_map = {
+        'N_Need_Score': {
+            'Maize': 3, 'Sugarcane': 3, 'Cotton': 3, 'Wheat': 3, 'Barley': 3,
+            'Paddy': 2, 'Tobacco': 2, 'Millets': 2, 'Oil seeds': 2,
+            'Ground Nuts': 1, 'Pulses': 1
+        },
+        'P_Need_Score': {
+            'Oil seeds': 3, 'Ground Nuts': 3, 'Pulses': 3,
+            'Maize': 2, 'Cotton': 2, 'Wheat': 2, 'Barley': 2, 'Paddy': 2, 'Tobacco': 2,
+            'Sugarcane': 1, 'Millets': 1
+        },
+        'K_Need_Score': {
+            'Ground Nuts': 3, 'Pulses': 3,
+            'Cotton': 2, 'Tobacco': 2, 'Oil seeds': 2,
+            'Maize': 1, 'Sugarcane': 1, 'Wheat': 1, 'Barley': 1, 'Paddy': 1, 'Millets': 1
+        }
+    }
+    df['N_Need_Score'] = df['Crop Type'].map(crop_needs_map['N_Need_Score'])
+    df['P_Need_Score'] = df['Crop Type'].map(crop_needs_map['P_Need_Score'])
+    df['K_Need_Score'] = df['Crop Type'].map(crop_needs_map['K_Need_Score'])
+
+    # Feature 2: Nutrient Gap / Deficiency Features
+    C = 20
+    df['N_Gap'] = df['N_Need_Score'] * C - df['Nitrogen']
+    df['P_Gap'] = df['P_Need_Score'] * C - df['Phosphorous']
+    df['K_Gap'] = df['K_Need_Score'] * C - df['Potassium']
+
+    # Feature 3: Soil Nutrient Ratio Features
+    df['N_P_Ratio_Soil'] = df['Nitrogen'] / (df['Phosphorous'] + 1)
+    df['N_K_Ratio_Soil'] = df['Nitrogen'] / (df['Potassium'] + 1)
+    df['P_K_Ratio_Soil'] = df['Phosphorous'] / (df['Potassium'] + 1)
+
+    soil_retention_map = {'Clayey': 3, 'Black': 2, 'Loamy': 2, 'Red': 1, 'Sandy': 0}
+    df['Moisture_Retention_Score'] = df['Soil Type'].map(soil_retention_map)
+    df['Effective_Moisture'] = df['Moisture_Retention_Score'] * df['Moisture']
+    df['Temp_Hum_Index'] = df['Temparature'] * df['Humidity']
+
     # --- Interaction and Ratio Features ---
     df['NP_Ratio'] = df['Nitrogen'] / (df['Phosphorous'] + 1e-6)
     df['NK_Ratio'] = df['Nitrogen'] / (df['Potassium'] + 1e-6)
@@ -135,7 +183,53 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     df['Potassium_Binned'] = pd.cut(df['Potassium'], bins=4, labels=['Low_K', 'Medium_K', 'High_K', 'Very_High_K'])
     df['Phosphorous_Binned'] = pd.cut(df['Phosphorous'], bins=4, labels=['Low_P', 'Medium_P', 'High_P', 'Very_High_P'])
 
-    df.drop(columns=['Temparature', 'Humidity', 'Moisture', 'Nitrogen', 'Potassium', 'Phosphorous', 'Total_NPK'], inplace=True)
+    print("--- Adding Advanced Features for XGBoost ---")
+
+    # Feature 5: Higher-Order Nutrient and Gap Features
+    df['N_Gap_Squared'] = df['N_Gap'] ** 2
+    df['P_Gap_Squared'] = df['P_Gap'] ** 2
+    df['NP_Gap_Interaction'] = df['N_Gap'] * df['P_Gap']
+    df['NK_Gap_Interaction'] = df['N_Gap'] * df['K_Gap']
+
+    # Feature 6: Discretization (Binning) of Continuous Features
+    df['Humidity_Bin'] = pd.cut(
+        df['Humidity'],
+        bins=[0, 60, 75, 100],
+        labels=['Low_Humidity', 'Medium_Humidity', 'High_Humidity']
+    )
+
+    # --- 4. Feature Engineering from Reference Data Logic ---
+    print("--- Adding Features based on Reference Data Logic ---")
+
+    # Feature 7: Sulphur Need Score
+    sulphur_needs_map = {
+        'Oil seeds': 1, 'Ground Nuts': 1, 'Pulses': 1,
+        'Maize': 0, 'Sugarcane': 0, 'Cotton': 0, 'Wheat': 0,
+        'Barley': 0, 'Paddy': 0, 'Tobacco': 0, 'Millets': 0
+    }
+    df['Sulphur_Need_Score'] = df['Crop Type'].map(sulphur_needs_map).fillna(0)
+
+    # Feature 8: Leaching Risk
+    df['Leaching_Risk'] = 3 - df['Moisture_Retention_Score']
+
+    # --- 5. Advanced Feature Engineering from Updated Reference ---
+    print("--- Adding Features based on Updated Reference Data Logic ---")
+
+    # Feature 9: Crop Seedling Sensitivity
+    # Represents crop sensitivity to fertilizer burn (phytotoxicity) at the seedling stage.
+    seedling_sensitivity_map = {
+        'Maize': 2, 'Cotton': 2,
+        'Sugarcane': 1, 'Wheat': 1, 'Barley': 1, 'Paddy': 1,
+        'Millets': 1, 'Tobacco': 1, 'Pulses': 1, 'Ground Nuts': 1, 'Oil seeds': 1
+    }
+    df['Crop_Seedling_Sensitivity'] = df['Crop Type'].map(seedling_sensitivity_map).fillna(1)
+
+    # Feature 10: Slow Release Benefit Score
+    # Represents the combined benefit of a slow-release fertilizer based on leaching risk and crop duration.
+    df['Slow_Release_Benefit_Score'] = df['Leaching_Risk'] + df['Crop Type'].apply(
+        lambda x: 1 if x == 'Sugarcane' else 0)
+
+    # df.drop(columns=['Temparature', 'Humidity', 'Moisture', 'Nitrogen', 'Potassium', 'Phosphorous', 'Total_NPK'], inplace=True)
 
     return df
 

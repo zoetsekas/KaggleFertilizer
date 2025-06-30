@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Fertilizer Explorer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Chosen Palette: Earthy Harmony -->
+    <!-- Application Structure Plan: A dashboard-style SPA is chosen for optimal user experience. The layout is a two-column design. The left column contains master controls: filters for crops and soil pH effect, and a complete, selectable list of fertilizers. This allows users to either browse freely or narrow their choices based on primary criteria. The right column is a detailed, multi-section view that updates upon selection. This structure facilitates easy comparison between products and presents complex information in digestible, thematic chunks (e.g., 'Key Stats', 'Agronomic Profile'), moving from high-level data to granular details. This non-linear, interactive approach is superior to a static report for user-driven exploration and understanding. -->
+    <!-- Visualization & Content Choices:
+        - Report Info: N, P, K percentages -> Goal: Inform -> Viz/Method: Large text display -> Justification: Primary identifier for fertilizers.
+        - Report Info: Nitrogen form breakdown (Urea, Ammoniacal, Nitrate) -> Goal: Compare/Inform -> Viz/Method: Horizontal Bar Chart (Chart.js) -> Interaction: Hover tooltips -> Justification: Visually quantifies the composition of the most critical nutrient, highlighting key behavioral differences (e.g., volatilization risk vs. leaching risk).
+        - Report Info: Leaching Potential, Phytotoxicity Risk, Soil pH Effect -> Goal: Compare/Relationships -> Viz/Method: Radar Chart (Chart.js) -> Interaction: Hover tooltips -> Justification: Creates a unique visual "fingerprint" for each fertilizer's environmental and safety profile, making complex trade-offs easy to grasp and compare at a glance.
+        - Report Info: Benefit Crops, Soil Types -> Goal: Organize/Filter -> Viz/Method: Dropdown filters and interactive list (HTML/JS) -> Interaction: Select to filter/view -> Justification: Empowers users to quickly find relevant products for their specific conditions.
+        - Report Info: Other properties (Release Rate, Application Method) -> Goal: Inform -> Viz/Method: Thematic text blocks with icons -> Justification: Provides crucial contextual and tactical information that complements the visual data.
+        - Library/Method: Chart.js for all visualizations, rendered on Canvas elements. Vanilla JS for all interactivity. Tailwind CSS for styling. -->
+    <!-- CONFIRMATION: NO SVG graphics used. NO Mermaid JS used. -->
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .chart-container { position: relative; width: 100%; max-width: 600px; margin-left: auto; margin-right: auto; height: 250px; max-height: 300px; }
+        @media (min-width: 768px) { .chart-container { height: 280px; } }
+        .active-fertilizer { background-color: #E3F2FD !important; border-left-color: #1E88E5 !important; }
+    </style>
+</head>
+<body class="bg-[#FDFBF7] text-[#4A4A4A]">
+
+    <div class="container mx-auto p-4 md:p-8">
+
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-bold text-[#386641]">Interactive Fertilizer Explorer</h1>
+            <p class="mt-2 text-lg text-[#6A994E]">An interactive tool to analyze and compare fertilizer properties. Select a fertilizer from the list on the left to explore its detailed characteristics and agronomic profile.</p>
+        </header>
+
+        <main class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+
+            <!-- Left Column: Filters and List -->
+            <div class="lg:col-span-1 bg-white rounded-xl shadow-md p-6 h-fit sticky top-8">
+                <h2 class="text-2xl font-bold mb-4 text-[#386641]">Find a Fertilizer</h2>
+
+                <div class="space-y-4">
+                    <div>
+                        <label for="cropFilter" class="block text-sm font-medium text-gray-700">Filter by Crop</label>
+                        <select id="cropFilter" class="mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-[#A7C957] focus:border-[#A7C957] sm:text-sm rounded-md shadow-sm">
+                            <option value="All">All Crops</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="mt-6">
+                    <h3 class="text-lg font-semibold mb-2 text-gray-800">Fertilizer List</h3>
+                    <div id="fertilizerList" class="max-h-[60vh] overflow-y-auto space-y-2 pr-2">
+                        <!-- Fertilizer list will be dynamically populated here -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Details View -->
+            <div id="detailsView" class="lg:col-span-2 bg-white rounded-xl shadow-lg p-6 md:p-8">
+                <!-- Details will be populated here -->
+                 <div id="initialMessage" class="flex flex-col items-center justify-center h-full text-center">
+                    <svg class="w-16 h-16 text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"></path></svg>
+                    <h2 class="text-2xl font-semibold text-gray-600">Select a Fertilizer</h2>
+                    <p class="text-gray-500 mt-2">Choose a fertilizer from the list to see its detailed properties.</p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const fertilizerData = [
+            {
+                "name": "28-28-0",
+                "n": 28, "p": 28, "k": 0,
+                "benefit_soils": ["Sandy", "Black", "Clayey", "Loamy"],
+                "benefit_crops": ["Maize", "Wheat", "Barley", "Cotton"],
+                "physical_form": "Granular",
+                "solubility_class": "High",
+                "is_organic": false,
+                "granule_size_min": 1, "granule_size_max": 6,
+                "n_form_urea_pct": 19, "n_form_ammoniacal_pct": 9, "n_form_nitrate_pct": 0,
+                "has_sulphur": false, "has_micronutrients": false,
+                "release_rate": "Slow",
+                "soil_ph_effect": "Acidifying",
+                "leaching_potential": "Medium",
+                "phytotoxicity_risk": "High",
+                "app_method": "Broadcasting, Top-dressing",
+                "app_timing": "Basal, Top-dressing"
+            },
+            {
+                "name": "17-17-17",
+                "n": 17, "p": 17, "k": 17,
+                "benefit_soils": ["Red", "Sandy"],
+                "benefit_crops": ["Maize", "Sugarcane", "Cotton", "Vegetables"],
+                "physical_form": "Granular",
+                "solubility_class": "High",
+                "is_organic": false,
+                "granule_size_min": 2, "granule_size_max": 4,
+                "n_form_urea_pct": 14, "n_form_ammoniacal_pct": 3, "n_form_nitrate_pct": 0,
+                "has_sulphur": false, "has_micronutrients": false,
+                "release_rate": "Fast",
+                "soil_ph_effect": "Acidifying",
+                "leaching_potential": "Medium",
+                "phytotoxicity_risk": "Medium",
+                "app_method": "Broadcasting, Top-dressing",
+                "app_timing": "Initial application, Top-dressing"
+            },
+            {
+                "name": "10-26-26",
+                "n": 10, "p": 26, "k": 26,
+                "benefit_soils": ["Red", "Sandy", "Loamy"],
+                "benefit_crops": ["Groundnuts", "Pulses", "Cotton", "Soybean"],
+                "physical_form": "Granular",
+                "solubility_class": "High",
+                "is_organic": false,
+                "granule_size_min": 2, "granule_size_max": 4,
+                "n_form_urea_pct": 0, "n_form_ammoniacal_pct": 10, "n_form_nitrate_pct": 0,
+                "has_sulphur": true, "has_micronutrients": true,
+                "release_rate": "Fast",
+                "soil_ph_effect": "Acidifying",
+                "leaching_potential": "Low",
+                "phytotoxicity_risk": "Low",
+                "app_method": "Broadcasting, Banding",
+                "app_timing": "Basal (Autumn/Spring)"
+            },
+            {
+                "name": "DAP",
+                "n": 18, "p": 46, "k": 0,
+                "benefit_soils": ["Red", "Sandy", "Black"],
+                "benefit_crops": ["Maize", "Wheat", "Barley", "Paddy", "Cotton"],
+                "physical_form": "Granular",
+                "solubility_class": "High",
+                "is_organic": false,
+                "granule_size_min": 1, "granule_size_max": 4,
+                "n_form_urea_pct": 0, "n_form_ammoniacal_pct": 18, "n_form_nitrate_pct": 0,
+                "has_sulphur": false, "has_micronutrients": false,
+                "release_rate": "Fast",
+                "soil_ph_effect": "Acidifying",
+                "leaching_potential": "Low",
+                "phytotoxicity_risk": "High",
+                "app_method": "Broadcasting, Banding",
+                "app_timing": "At Sowing"
+            },
+            {
+                "name": "20-20-0",
+                "n": 20, "p": 20, "k": 0,
+                "benefit_soils": ["Red", "Sandy", "Loamy"],
+                "benefit_crops": ["Maize", "Wheat", "Paddy"],
+                "physical_form": "Powder",
+                "solubility_class": "High",
+                "is_organic": false,
+                "granule_size_min": null, "granule_size_max": null,
+                "n_form_urea_pct": 20, "n_form_ammoniacal_pct": 0, "n_form_nitrate_pct": 0,
+                "has_sulphur": false, "has_micronutrients": false,
+                "release_rate": "Fast",
+                "soil_ph_effect": "Acidifying",
+                "leaching_potential": "Medium",
+                "phytotoxicity_risk": "Medium",
+                "app_method": "Foliar Spray, Fertigation",
+                "app_timing": "During growing season"
+            },
+            {
+                "name": "14-35-14",
+                "n": 14, "p": 35, "k": 14,
+                "benefit_soils": ["Red", "Black", "Clayey"],
+                "benefit_crops": ["Groundnuts", "Pulses", "Cotton", "Oilseeds", "Sugarcane"],
+                "physical_form": "Granular",
+                "solubility_class": "High",
+                "is_organic": false,
+                "granule_size_min": 1, "granule_size_max": 4,
+                "n_form_urea_pct": 0, "n_form_ammoniacal_pct": 14, "n_form_nitrate_pct": 0,
+                "has_sulphur": true, "has_micronutrients": true,
+                "release_rate": "Fast",
+                "soil_ph_effect": "Neutral",
+                "leaching_potential": "Low",
+                "phytotoxicity_risk": "Low",
+                "app_method": "Broadcasting, Banding",
+                "app_timing": "Basal application"
+            },
+            {
+                "name": "Urea",
+                "n": 46, "p": 0, "k": 0,
+                "benefit_soils": ["Red", "Sandy", "Clayey", "Loamy"],
+                "benefit_crops": ["Maize", "Sugarcane", "Cotton", "Wheat", "Paddy"],
+                "physical_form": "Granular",
+                "solubility_class": "High",
+                "is_organic": false,
+                "granule_size_min": 1, "granule_size_max": 4,
+                "n_form_urea_pct": 46, "n_form_ammoniacal_pct": 0, "n_form_nitrate_pct": 0,
+                "has_sulphur": false, "has_micronutrients": false,
+                "release_rate": "Slow",
+                "soil_ph_effect": "Acidifying",
+                "leaching_potential": "Medium",
+                "phytotoxicity_risk": "High",
+                "app_method": "Top-dressing, Incorporation",
+                "app_timing": "Split applications, Top-dressing"
+            }
+        ];
+
+        const fertilizerListEl = document.getElementById('fertilizerList');
+        const detailsViewEl = document.getElementById('detailsView');
+        const cropFilterEl = document.getElementById('cropFilter');
+        const initialMessageEl = document.getElementById('initialMessage');
+
+        let nitrogenChart = null;
+        let agronomicChart = null;
+
+        const riskMapping = { 'Low': 1, 'Medium': 2, 'High': 3 };
+
+        function populateCropFilter() {
+            const crops = new Set();
+            fertilizerData.forEach(f => f.benefit_crops.forEach(c => crops.add(c)));
+            const sortedCrops = Array.from(crops).sort();
+            sortedCrops.forEach(crop => {
+                const option = document.createElement('option');
+                option.value = crop;
+                option.textContent = crop;
+                cropFilterEl.appendChild(option);
+            });
+        }
+
+        function populateFertilizerList(filter = 'All') {
+            fertilizerListEl.innerHTML = '';
+            const filteredData = filter === 'All'
+                ? fertilizerData
+                : fertilizerData.filter(f => f.benefit_crops.includes(filter));
+
+            filteredData.forEach(fertilizer => {
+                const div = document.createElement('div');
+                div.className = 'p-3 bg-gray-50 rounded-lg cursor-pointer hover:bg-gray-100 border-l-4 border-transparent transition-colors';
+                div.innerHTML = `<h4 class="font-semibold text-gray-800">${fertilizer.name}</h4><p class="text-sm text-gray-500">N-P-K: ${fertilizer.n}-${fertilizer.p}-${fertilizer.k}</p>`;
+                div.onclick = () => {
+                    displayFertilizerDetails(fertilizer);
+                    document.querySelectorAll('#fertilizerList > div').forEach(el => el.classList.remove('active-fertilizer'));
+                    div.classList.add('active-fertilizer');
+                };
+                fertilizerListEl.appendChild(div);
+            });
+        }
+
+        function displayFertilizerDetails(fertilizer) {
+            initialMessageEl.style.display = 'none';
+
+            detailsViewEl.innerHTML = `
+                <div class="animate-fade-in">
+                    <!-- Header -->
+                    <div class="pb-4 border-b border-gray-200 mb-6">
+                        <h2 class="text-4xl font-bold text-[#386641]">${fertilizer.name}</h2>
+                        <p class="text-xl text-gray-600 mt-1">N-P-K: <span class="font-semibold">${fertilizer.n}-${fertilizer.p}-${fertilizer.k}</span></p>
+                    </div>
+
+                    <!-- Main Grid -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+                        <!-- Physicochemical Properties -->
+                        <div class="bg-gray-50 p-4 rounded-lg">
+                            <h3 class="text-xl font-semibold mb-3 text-[#BC6C25]">Physicochemical Properties</h3>
+                            <div class="space-y-2 text-sm">
+                                <p><strong>Physical Form:</strong> ${fertilizer.physical_form}</p>
+                                <p><strong>Solubility:</strong> ${fertilizer.solubility_class}</p>
+                                ${fertilizer.granule_size_min ? `<p><strong>Granule Size:</strong> ${fertilizer.granule_size_min} - ${fertilizer.granule_size_max} mm</p>` : ''}
+                                ${fertilizer.has_sulphur ? `<p class="text-green-700 font-medium">Contains Sulphur</p>` : ''}
+                                ${fertilizer.has_micronutrients ? `<p class="text-green-700 font-medium">Contains Micronutrients</p>` : ''}
+                            </div>
+                        </div>
+
+                        <!-- Application -->
+                        <div class="bg-gray-50 p-4 rounded-lg">
+                            <h3 class="text-xl font-semibold mb-3 text-[#BC6C25]">Application Profile</h3>
+                            <div class="space-y-2 text-sm">
+                                <p><strong>Release Rate:</strong> ${fertilizer.release_rate}</p>
+                                <p><strong>Primary Method:</strong> ${fertilizer.app_method}</p>
+                                <p><strong>Primary Timing:</strong> ${fertilizer.app_timing}</p>
+                            </div>
+                        </div>
+
+                        <!-- Nitrogen Forms Chart -->
+                        <div class="md:col-span-2 bg-gray-50 p-4 rounded-lg">
+                            <h3 class="text-xl font-semibold mb-2 text-[#BC6C25]">Nitrogen Composition</h3>
+                            <p class="text-xs text-gray-500 mb-3">This chart shows the breakdown of the total nitrogen content into its different chemical forms, which determines its behavior in the soil.</p>
+                            <div class="chart-container h-32 md:h-40">
+                                <canvas id="nitrogenChart"></canvas>
+                            </div>
+                        </div>
+
+                        <!-- Agronomic Profile Chart -->
+                        <div class="md:col-span-2 bg-gray-50 p-4 rounded-lg">
+                            <h3 class="text-xl font-semibold mb-2 text-[#BC6C25]">Agronomic & Environmental Profile</h3>
+                             <p class="text-xs text-gray-500 mb-3">This profile visualizes key agronomic characteristics. A larger shape indicates higher potential for that effect.</p>
+                            <div class="chart-container">
+                                <canvas id="agronomicChart"></canvas>
+                            </div>
+                        </div>
+
+                        <!-- Suitable For -->
+                        <div class="md:col-span-2 bg-gray-50 p-4 rounded-lg">
+                            <h3 class="text-xl font-semibold mb-3 text-[#BC6C25]">Recommended For</h3>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                                <div>
+                                    <h4 class="font-semibold text-gray-700">Crops:</h4>
+                                    <div class="flex flex-wrap gap-2 mt-2">
+                                        ${fertilizer.benefit_crops.map(c => `<span class="bg-[#A7C957] text-white text-xs font-semibold px-2.5 py-1 rounded-full">${c}</span>`).join('')}
+                                    </div>
+                                </div>
+                                <div>
+                                    <h4 class="font-semibold text-gray-700">Soils:</h4>
+                                     <div class="flex flex-wrap gap-2 mt-2">
+                                        ${fertilizer.benefit_soils.map(s => `<span class="bg-[#606C38] text-white text-xs font-semibold px-2.5 py-1 rounded-full">${s}</span>`).join('')}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            createNitrogenChart(fertilizer);
+            createAgronomicChart(fertilizer);
+        }
+
+        function createNitrogenChart(fertilizer) {
+            const ctx = document.getElementById('nitrogenChart').getContext('2d');
+            if (nitrogenChart) {
+                nitrogenChart.destroy();
+            }
+            nitrogenChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: ['Nitrogen Forms'],
+                    datasets: [
+                        { label: 'Urea %', data: [fertilizer.n_form_urea_pct], backgroundColor: '#DDA15E', borderWidth: 1 },
+                        { label: 'Ammoniacal %', data: [fertilizer.n_form_ammoniacal_pct], backgroundColor: '#BC6C25', borderWidth: 1 },
+                        { label: 'Nitrate %', data: [fertilizer.n_form_nitrate_pct], backgroundColor: '#606C38', borderWidth: 1 }
+                    ]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { stacked: true, title: { display: true, text: 'Percentage of Total Weight' } },
+                        y: { stacked: true, display: false }
+                    },
+                    plugins: { legend: { position: 'bottom' } }
+                }
+            });
+        }
+
+        function createAgronomicChart(fertilizer) {
+            const ctx = document.getElementById('agronomicChart').getContext('2d');
+            if (agronomicChart) {
+                agronomicChart.destroy();
+            }
+            agronomicChart = new Chart(ctx, {
+                type: 'radar',
+                data: {
+                    labels: ['Leaching Potential', 'Phytotoxicity Risk', 'Soil Acidification'],
+                    datasets: [{
+                        label: fertilizer.name,
+                        data: [
+                            riskMapping[fertilizer.leaching_potential],
+                            riskMapping[fertilizer.phytotoxicity_risk],
+                            fertilizer.soil_ph_effect === 'Acidifying' ? 3 : (fertilizer.soil_ph_effect === 'Neutral' ? 1 : 0)
+                        ],
+                        fill: true,
+                        backgroundColor: 'rgba(188, 108, 38, 0.2)',
+                        borderColor: 'rgb(188, 108, 38)',
+                        pointBackgroundColor: 'rgb(188, 108, 38)',
+                        pointBorderColor: '#fff',
+                        pointHoverBackgroundColor: '#fff',
+                        pointHoverBorderColor: 'rgb(188, 108, 38)'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        r: {
+                            angleLines: { display: true },
+                            suggestedMin: 0,
+                            suggestedMax: 3,
+                            ticks: {
+                                stepSize: 1,
+                                backdropColor: 'transparent',
+                                callback: function(value) {
+                                    if (value === 1) return 'Low';
+                                    if (value === 2) return 'Medium';
+                                    if (value === 3) return 'High';
+                                    return '';
+                                }
+                            }
+                        }
+                    },
+                    plugins: { legend: { display: false } }
+                }
+            });
+        }
+
+        cropFilterEl.addEventListener('change', (e) => {
+            populateFertilizerList(e.target.value);
+            detailsViewEl.innerHTML = '';
+            detailsViewEl.appendChild(initialMessageEl);
+            initialMessageEl.style.display = 'flex';
+        });
+
+        // Initial setup
+        populateCropFilter();
+        populateFertilizerList();
+    </script>
+</body>
+</html>

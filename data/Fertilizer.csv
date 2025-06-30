@@ -1,0 +1,8 @@
+Fertilizer,Nitrogen_Percentage,Phosphorous_Percentage,Potassium_Percentage,Benefit_Soils, Benefit_Crops
+28-28,28,28,0,"Sandy,Black,Clayey,Loamy","Maize,Wheat,Barley,Cotton"
+17-17-17,17,17,17,"Red,Sandy","Maize,Sugarcane,Cotton"
+10-26-26,10,26,26,"Red,Sandy","Ground Nuts,Pulses,Cotton"
+DAP,18,46,0,"Red,Sandy","Maize,Wheat,Barley,Paddy,Cotton"
+20-20,20,20,0,"Red,Sandy","Maize,Wheat"
+14-35-14,14,35,14,"Red,Black","Ground Nuts,Pulses,Cotton,Oil seeds"
+Urea,46,0,0,"Red,Sandy","Maize,Sugarcane,Cotton"
